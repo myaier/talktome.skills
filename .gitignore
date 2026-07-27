@@ -1,0 +1,3 @@
+# per-user session tokens written by deploy.py --save-token — never commit
+.env
+__pycache__/
