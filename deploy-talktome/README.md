@@ -1,6 +1,6 @@
 # deploy-talktome
 
-Claude Code 技能：把你的资料做成 [TalkToMe](https://talkto.me) 分身并发布上线。
+Claude Code 技能：把你的资料做成 [TalkToMe](https://talkto.bio) 分身并发布上线。
 
 ## 能做什么
 
