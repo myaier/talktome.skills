@@ -125,7 +125,13 @@ def main() -> None:
     def call(path: str, body: bytes, content_type: str, _retried: bool = False) -> dict:
         req = urllib.request.Request(
             base + path, data=body, method="POST",
-            headers={"Authorization": f"Bearer {auth['token']}", "Content-Type": content_type},
+            headers={
+                "Authorization": f"Bearer {auth['token']}",
+                "Content-Type": content_type,
+                # Analytics attribution only (never authorization): lets the backend label
+                # skill-driven API usage as source_platform=skill. Unknown to old servers → ignored.
+                "x-client-source": "skill",
+            },
         )
         try:
             with urllib.request.urlopen(req, timeout=120) as resp:
