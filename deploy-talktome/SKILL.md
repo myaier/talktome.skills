@@ -76,6 +76,8 @@ python scripts/deploy.py --src <目录>
    python scripts/deploy.py --src <分身目录> --set-handle <handle>
    ```
    脚本会先过平台校验，不可用时给出原因和建议名，换个名字重试。**handle 设置后不可更改**，设置前必须让用户明确确认。
+   设置 handle 的同时会一并创建分身的**邮箱地址** `{handle}@talkto.bio`（同一个 slug，一起确认、一起锁定）——把这一点也告知用户。
+   历史修复：早期版本建的分身只有 handle 没有邮箱，对这类分身用**相同的 slug** 重跑一次 `--set-handle` 即可补上邮箱。
 2. **用户确认发布**后：
    ```bash
    python scripts/deploy.py --src <分身目录> --publish

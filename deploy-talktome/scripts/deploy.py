@@ -16,6 +16,8 @@
 #                     [--replace-skills]     delete each skill first (use when skill files were renamed/removed)
 #                     [--replace-knowledge]  delete existing knowledge files first (same reason)
 #   set handle:     python deploy.py --src <dir> --set-handle <slug>               # checked first; SET ONCE, locked after
+#                     (also sets the agent's email address to <slug>@talkto.bio — same slug, confirmed together;
+#                      re-run with the SAME slug to repair older agents that got a handle but no email)
 #   publish:        python deploy.py --src <dir> --publish                         # outward-facing: confirm with the owner first
 #   list agents:    python deploy.py --list                                        # name / agentId / handle / status
 #   show config:    python deploy.py --src <dir> --show                            # profile + soul + greeting + file inventory
@@ -23,7 +25,8 @@
 #
 # API notes (all endpoints are POST, base https://prod-backend.talkto.bio, auth = Authorization: Bearer <accessToken>):
 #   /api/agents/create   {agentName, soulContent<=100k chars, greeting?<=2000 chars} -> {agent:{id,...}}
-#   /api/agents/update   {agentId, agentName?, soulContent?, greeting?, handle?}  handle can be set ONCE (then locked)
+#   /api/agents/update   {agentId, agentName?, soulContent?, greeting?, handle?, emailLocalpart?}
+#                                                   handle+emailLocalpart can each be set ONCE (then locked)
 #   /api/agents/publish  {agentId}                  makes talkto.bio/{handle} public; requires handle
 #   /api/handles/check   {handle}                   -> {available, reason?, suggestion?}
 #   /api/knowledge-docs/upload?agentId=&filename=   raw file bytes; filename must not contain '/'
@@ -217,15 +220,28 @@ def main() -> None:
 
     if args.set_handle:
         agent_id = resolve_agent_id(required=True)
-        check = post_json("/api/handles/check", {"handle": args.set_handle})
-        if not check.get("available"):
-            sys.exit(
-                f"handle unavailable: {args.set_handle} (reason={check.get('reason')}, "
-                f"suggestion={check.get('suggestion')})"
-            )
-        post_json("/api/agents/update", {"agentId": agent_id, "handle": args.set_handle})
+        # Mirrors the App's domain-confirm modal: homepage handle AND email localpart are the SAME slug,
+        # confirmed together and locked. Repair case: an agent whose handle is already this slug but whose
+        # email was never set (older skill versions forgot it) — skip the availability check (the slug is
+        # "taken" by this very agent) and let the update set just emailLocalpart.
+        agent = post_json("/api/agents/get", {"agentId": agent_id})["agent"]
+        current = agent.get("handle")
+        if current and current != args.set_handle:
+            sys.exit(f"handle already locked: {current} (it can never be changed)")
+        if not current:
+            check = post_json("/api/handles/check", {"handle": args.set_handle})
+            if not check.get("available"):
+                sys.exit(
+                    f"handle unavailable: {args.set_handle} (reason={check.get('reason')}, "
+                    f"suggestion={check.get('suggestion')})"
+                )
+        post_json(
+            "/api/agents/update",
+            {"agentId": agent_id, "handle": args.set_handle, "emailLocalpart": args.set_handle},
+        )
         write_manifest({"agentId": agent_id, "handle": args.set_handle})
         print(f"handle set: talkto.bio/{args.set_handle}  (locked — it can never be changed)")
+        print(f"email set:  {args.set_handle}@talkto.bio")
         return
 
     if args.publish:
