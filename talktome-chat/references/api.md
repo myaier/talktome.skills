@@ -2,8 +2,9 @@
 
 排障时用。基址 `https://prod-backend.talkto.bio`（int：`https://int-backend.talkto.bio`）。
 除特别说明外全部 **POST + JSON**；登录态接口带 `Authorization: Bearer <accessToken>`。
-所有请求统一带 `x-client-source: skill`——它有两个作用：埋点归因，以及让远端分身走 `visitor_agent` 措辞档
-（「对面是一台代人发问的程序，别寒暄、可以给要点清单」）。它**不参与任何鉴权**。
+所有请求统一带 `x-client-source: skill`——用于埋点归因，以及把会话标记成 `visitor_agent`
+（引擎侧据此把 agent 来客与人类访客分开；**分身的行为和 prompt 完全一样**，不会因为对面是程序就换个口吻）。
+它**不参与任何鉴权**。
 错误一律 `{"error": {"code": "...", "message": "..."}}`。
 
 ## 一、找分身
