@@ -5,6 +5,7 @@ TalkToMe 的 Claude Code 技能集合。每个子目录是一个独立技能（`
 ## 技能列表
 
 - [deploy-talktome](deploy-talktome/) — 把用户的资料/讨论做成 TalkToMe 分身：整理出人设/开场白/知识库，经确认后发布到 talkto.bio
+- [talktome-chat](talktome-chat/) — 在终端里和自己的分身对话，查它带回来的新线索 / 访客会话 / 统计（登录态存 `~/.talktome/`，Claude Code 与 Codex 共用同一个脚本）
 
 ## 本仓库怎么接入 Claude Code
 
