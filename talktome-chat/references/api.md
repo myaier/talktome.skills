@@ -1,53 +1,69 @@
 # talktome-chat 用到的后端接口
 
 排障时用。基址 `https://prod-backend.talkto.bio`（int：`https://int-backend.talkto.bio`）。
-除特别说明外全部 **POST + JSON**，鉴权 `Authorization: Bearer <accessToken>`，并统一带 `x-client-source: skill`（只用于埋点归因，不参与鉴权）。
+除特别说明外全部 **POST + JSON**；登录态接口带 `Authorization: Bearer <accessToken>`。
+所有请求统一带 `x-client-source: skill`——它有两个作用：埋点归因，以及让远端分身走 `visitor_agent` 措辞档
+（「对面是一台代人发问的程序，别寒暄、可以给要点清单」）。它**不参与任何鉴权**。
 错误一律 `{"error": {"code": "...", "message": "..."}}`。
 
-## 登录
+## 一、找分身
+
+| 接口 | 请求 | 响应 |
+| --- | --- | --- |
+| `/api/public/agents/search` | `{query(≤500字), limit?(1..20), minSimilarity?(0..1)}` | `{agents:[{agentId, handle, name, greeting, soulExcerpt, avatarUrl, homepage, similarity}]}` |
+
+- **免登录**；但带上有效 token 时会**排除调用者自己的分身**（自己跟自己聊没意义）。
+- 匹配走语义向量：分身的「名字 / 开场白 / 人物描述」三段分区文本在入库时算成 1024 维向量（千问 text-embedding-v3，由 xchat 算），检索时把用户需求也算成向量，按余弦相似度召回（pgvector）。
+- 只召回 `status=published` 且有 handle、主人账号未注销的分身。
+- `minSimilarity` 默认 0.5。实测口径：**对口的分身 0.63~0.77，库里没有对口的最高才 0.50**——所以返回空是正常且有意义的答案，别硬塞。
+- 502 `SEARCH_UNAVAILABLE` = 向量化服务不可用（xchat 挂了 / 没配 key）。
+
+## 二、跟别人的分身聊（访客通道）
+
+和网页上的人类访客走同一条路，只是身份换成了「登录用户 + 访客 cookie」。
+
+| 接口 | 请求 | 说明 |
+| --- | --- | --- |
+| `/api/public/bind` | `{slug}` | **需登录**。把访客身份绑到账号上，并把账号手机号写进 `visitors.phone` ——对方主人这才拿得到联系方式。每个分身做一次，脚本记在本地 `state.json` |
+| `/api/public/chat` | `{slug, message(≤4000), conversationId?}` | **SSE**，见下。不传 conversationId=新开一条 |
+| `/api/public/history` | `{slug, conversationId, limit?(1..200)}` | `{conversationId, roundCount, messages:[{entryId, role, text, createdAt}]}` |
+
+SSE 帧（`text/event-stream`，每帧一行 `data: {...}`）：
+
+```
+data: {"type":"meta","conversationId":"..."}   # 第一帧，新会话靠它拿 id
+data: {"type":"delta","text":"..."}            # 流式正文
+data: {"type":"gate"}                          # 匿名访客超 5 轮门控 —— 登录后不会出现
+data: {"type":"error","message":"..."}         # 出错（HTTP 仍是 200，流已经开了）
+data: {"type":"done"}
+```
+
+关键机制：
+
+- **访客身份 = `ttm_visitor` cookie**（HttpOnly，一个 browserId 通吃所有分身，服务端按 `browserId.agentId` 拆出每个分身下的访客行）。命令行必须自己存，丢了就变成新访客——对方主人的后台会堆出一串各说一句话的"新线索"。
+- **5 轮匿名门控**：带着有效登录 token 就自动放开，所以流程要求先登录。
+- **每次对话都会在对方主人后台产生一条真实线索**：`visitors` 行 + 轮数 + 未读标记，会话结束后还会被 AI 摘要成要点。所以第一句要交代来意，也不要空聊。
+- 失败**不要自动重发**——消息可能已经到达对面分身。
+
+## 三、登录
 
 | 接口 | 请求 | 响应 / 备注 |
 | --- | --- | --- |
 | `/api/auth/sms/send` | `{phone, cc}` | `{ok:true}`；`428 CAPTCHA_REQUIRED` = 风控要点选验证码（终端做不了，去 App 登一次） |
-| `/api/auth/sms/verify` | `{phone, cc, code, source:"skill"}` | `{userId, accessToken, refreshToken, expiresIn, isNewUser, displayName, phone}`；没注册过的号自动建号，`source:"skill"` 是注册渠道归因 |
-| `/api/auth/refresh` | `{refreshToken}` | 新的 access+refresh 对。**refresh token 一次性轮换**：旧的用第二次会触发服务端重放检测，整条 family 被吊销 → 只能重新登录。脚本用 `~/.talktome/refresh.lock` 串行化 |
+| `/api/auth/sms/verify` | `{phone, cc, code, source:"skill"}` | `{userId, accessToken, refreshToken, expiresIn, isNewUser, displayName, phone}`；没注册过的号自动建号 |
+| `/api/auth/refresh` | `{refreshToken}` | 新的 access+refresh 对。**refresh token 一次性轮换**：旧的用第二次会触发重放检测，整条 family 被吊销 → 只能重新登录。脚本用 `~/.talktome/refresh.lock` 串行化 |
 | `/api/auth/logout` | `{refreshToken}` | 吊销本机这条 family |
 
-access token 1 小时过期；refresh token 30 天滑动续期（每次轮换重置），超 30 天没用要重新短信登录。
+access token 1 小时过期；refresh token 30 天滑动续期（每次轮换重置）。
 
-## 分身与对话
-
-| 接口 | 请求 | 响应 |
-| --- | --- | --- |
-| `/api/agents/list` | `{}` | `{agents:[{id, agent_name, handle, status, soul_content, greeting, avatar_url, ...}]}` |
-| `/api/agents/chat` | `{agentId, message(1..4000), conversationId?}` | **SSE**，见下 |
-| `/api/agents/chat/history` | `{agentId, conversationId, after?, limit?(1..200)}` | `{conversationId, messages:[{entryId, role, text, createdAt}], hasMore, nextAfter?}` |
-
-`/api/agents/chat` 的 SSE 帧（`text/event-stream`，每帧一行 `data: {...}`）：
-
-```
-data: {"type":"meta","conversationId":"..."}   # 第一帧，新建会话时靠它拿 id
-data: {"type":"delta","text":"..."}            # 流式正文，拼起来就是回复
-data: {"type":"error","message":"..."}         # 出错（HTTP 仍是 200，流已经开了）
-data: {"type":"done"}                          # 结束
-```
-
-- 不传 `conversationId` = 新开一条会话；传了 = 续聊。**服务端不存"我的会话列表"**，会话 id 由本脚本记在 `~/.talktome/state.json`，丢了就用 `--new` 重开。
-- 会话属主由 xchat 的 `(agentId, userId, conversationId)` 三键保证：别人的会话 id 拿不到，返回 `404 CONVERSATION_NOT_FOUND`。
-- 这条通道**不会**产生访客记录：不写 `visitors`、不进 `/api/conversations/list`、不被摘要 worker 处理、不计入 `/api/stats/overview` 的三个数字（单独记 `usage_events.kind='api_chat'`）。
-- 失败**不要自动重发**——消息可能已经到达分身，重试会重复发。
-
-## 访客线索
+## 四、其它
 
 | 接口 | 请求 | 响应 |
 | --- | --- | --- |
-| `/api/conversations/list` | `{agentId?}` | `{conversations:[{id, agentId, agentName, visitorName, visitorPhone, visitorWechat, visitorEmail, roundCount, unread, lastMessageAt, summaryItems:[{id, content, acked}]}]}`；当前**返回全部**，"今天/未读"由脚本本地过滤（服务端过滤参数是 phase 2） |
-| `/api/conversations/messages` | `{conversationId, after?, limit?(1..500)}` | `{conversation, messages, hasMore, nextAfter?, summaryItems}` |
-| `/api/conversations/update` | `{conversationId, unread:false}` | 标记已读 |
-| `/api/conversations/summary/ack` | `{itemId, acked}` | 单条摘要要点 |
-| `/api/conversations/summary/ack-all` | `{conversationId}` | 整条会话的要点全标 |
-| `/api/stats/overview` | `{}` | `{visitors, chats, emails}`（累计，访客口径） |
-| `/api/user/profile` | `{}` | `{profile:{userId, displayName, phone, email, ...}}` |
+| `/api/user/profile` | `{}` | `{profile:{userId, displayName, phone, ...}}`（`whoami`） |
+
+> 「看自己分身收到了哪些访客线索」不在这个技能范围内（那是 App 信息页的事）。相关接口
+> `/api/conversations/*`、`/api/stats/overview` 都还在，将来要做单独的技能可以直接用。
 
 ## 错误码 → 脚本行为
 
@@ -55,10 +71,12 @@ data: {"type":"done"}                          # 结束
 | --- | --- | --- |
 | 401 | `TOKEN_EXPIRED` / `INVALID_TOKEN` | 自动 refresh 后重试一次 |
 | 401 | `INVALID_REFRESH` / `REFRESH_EXPIRED` / `REFRESH_REUSE` | 清本地凭据，退出码 41，引导重新登录 |
+| 401 | `UNAUTHORIZED`（bind） | 没登录就想聊 → 退出码 41 |
 | 403 | `ACCOUNT_DELETED` | 账号已注销，终止 |
-| 404 | `AGENT_NOT_FOUND` | 不是本人的分身 / id 打错 → 重新 `agents` 核对 |
-| 404 | `CONVERSATION_NOT_FOUND` | 会话不存在或不属于这个分身；本机记的会话失效时自动重开一条 |
+| 404 | `AGENT_NOT_FOUND` | handle 打错 / 该分身已下线 → 重新 `find` |
+| 404 | `CONVERSATION_NOT_FOUND` | 会话不存在或不属于你 → 用 `--new` 重开 |
 | 428 | `CAPTCHA_REQUIRED` | 退出码 42，请用户去 App 登一次 |
-| 502 | `XCHAT_UNAVAILABLE` | 对话服务暂时不可用，提示稍后再试，不自动重发消息 |
+| 502 | `SEARCH_UNAVAILABLE` | 检索服务不可用，稍后再试 |
+| 502 | `XCHAT_UNAVAILABLE` | 对话服务不可用，不自动重发消息 |
 
 非流式请求在 5xx / 网络故障时自动退避重试 2 次（1s、4s）；SSE 不重试。
