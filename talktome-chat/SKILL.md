@@ -75,7 +75,7 @@ python scripts/talktome.py logout
 
 ## 环境
 
-打生产 `https://prod-backend.talkto.bio`，脚本里已内置，不用配也不用传。
+打生产 `https://prod-backend.talkto.bio`，脚本里写死，不用配也不用传。
 
 登录态存在 `~/.talktome/`（access token 过期自动续期，一次登录能管 30 天）——**不要打印它的内容、不要拷进项目目录**。
 
