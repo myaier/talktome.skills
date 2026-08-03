@@ -13,11 +13,13 @@
 | --- | --- | --- |
 | `/api/public/agents/search` | `{query(≤500字), limit?(1..20), minSimilarity?(0..1)}` | `{agents:[{agentId, handle, name, greeting, soulExcerpt, avatarUrl, homepage, similarity}]}` |
 
-- **免登录**；但带上有效 token 时会**排除调用者自己的分身**（自己跟自己聊没意义）。
+- 接口本身**免登录**，但带上有效 token 时会**排除调用者自己的分身**（自己跟自己聊没意义）——
+  所以技能的流程是先登录再检索，见 SKILL.md。
 - 匹配走语义向量：分身的「名字 / 开场白 / 人物描述」三段分区文本在入库时算成 1024 维向量（千问 text-embedding-v3，由 xchat 算），检索时把用户需求也算成向量，按余弦相似度召回（pgvector）。
 - 只召回 `status=published` 且有 handle、主人账号未注销的分身。
 - `minSimilarity` 默认 0.5。实测口径：**对口的分身 0.63~0.77，库里没有对口的最高才 0.50**——所以返回空是正常且有意义的答案，别硬塞。
-- 502 `SEARCH_UNAVAILABLE` = 向量化服务不可用（xchat 挂了 / 没配 key）。
+- 502 `SEARCH_UNAVAILABLE` = 服务端算不出向量。**几乎总是配置问题**（`EMBEDDING_API_KEY` 没配、
+  或 pod 出不了公网连不到模型端点），不是瞬时故障——重试无用，看 backend 日志的 `[agent-search]` 一行。
 
 ## 二、跟别人的分身聊（访客通道）
 
@@ -77,7 +79,7 @@ access token 1 小时过期；refresh token 30 天滑动续期（每次轮换重
 | 404 | `AGENT_NOT_FOUND` | handle 打错 / 该分身已下线 → 重新 `find` |
 | 404 | `CONVERSATION_NOT_FOUND` | 会话不存在或不属于你 → 用 `--new` 重开 |
 | 428 | `CAPTCHA_REQUIRED` | 退出码 42，请用户去 App 登一次 |
-| 502 | `SEARCH_UNAVAILABLE` | 检索服务不可用，稍后再试 |
+| 502 | `SEARCH_UNAVAILABLE` | 服务端配置/依赖问题，**别重试**，告诉用户联系管理员 |
 | 502 | `XCHAT_UNAVAILABLE` | 对话服务不可用，不自动重发消息 |
 
 非流式请求在 5xx / 网络故障时自动退避重试 2 次（1s、4s）；SSE 不重试。

@@ -25,9 +25,10 @@
 # attached once you're logged in (POST /api/public/bind writes it through). Tell the user that before
 # the first message; it's their contact details being handed over.
 #
+# 只有生产一个环境（BASE_URL 写死；TALKTOME_BASE 是本仓库联调用的后门，不对外说明）。
 # API notes (all POST, base https://prod-backend.talkto.bio, auth = Authorization: Bearer <accessToken>,
-#            every request carries x-client-source: skill — that header also makes the remote agent use
-#            the visitor_agent prompt profile, i.e. "the visitor is a program, skip the small talk"):
+#            every request carries x-client-source: skill —— 埋点归因 + 把会话标记成 visitor_agent
+#            （只是来客标签，远端分身的行为和 prompt 与人类访客完全一样）):
 #   /api/public/agents/search {query, limit?, minSimilarity?} -> {agents:[{handle,name,greeting,
 #                                     soulExcerpt, similarity}]}  语义检索，免登录，排除自己的分身
 #   /api/public/bind      {slug}                     绑访客身份↔账号（把手机号写给对方主人当线索）
@@ -49,10 +50,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import NoReturn
 
-BASES = {
-    "prod": "https://prod-backend.talkto.bio",
-    "int": "https://int-backend.talkto.bio",
-}
+# 用户只有一个环境：生产。不做 int/prod 切换——多一个开关就多一种"打错地方"的可能。
+# TALKTOME_BASE 是留给本仓库自己联调的后门（指向本地或 int 的 backend），不对外说明。
+BASE_URL = (os.environ.get("TALKTOME_BASE") or "https://prod-backend.talkto.bio").rstrip("/")
 HOME = Path(os.environ.get("TALKTOME_HOME") or (Path.home() / ".talktome"))
 CREDENTIALS_PATH = HOME / "credentials.json"
 STATE_PATH = HOME / "state.json"
@@ -141,16 +141,13 @@ class Lock:
 class Session:
     """Credentials + the auto-refresh dance. One instance per command run."""
 
-    def __init__(self, base: str):
-        self.base = base
+    def __init__(self) -> None:
+        self.base = BASE_URL
         self.data = read_json_file(CREDENTIALS_PATH)
-        if self.data and self.data.get("base") and self.data["base"] != base:
-            # Tokens are per-environment: an int token means nothing to prod. Don't silently 401 later.
-            die(
-                f"已保存的登录属于 {self.data['base']}，当前请求的是 {base}。"
-                f"换环境请先 `logout` 再重新 `login`（或加 --env 用回原环境）。",
-                EXIT_NEEDS_LOGIN,
-            )
+        if self.data and self.data.get("base") and self.data["base"] != self.base:
+            # 只在联调切过 TALKTOME_BASE 时才可能撞上：token 是跟环境绑的，换了地址就用不了，
+            # 与其等它在某个接口上 401，不如现在说清楚。
+            die(f"已保存的登录属于 {self.data['base']}，当前要打的是 {self.base}——先 `logout` 再重新 `login`。", EXIT_NEEDS_LOGIN)
 
     @property
     def access_token(self) -> str:
@@ -437,7 +434,7 @@ def cmd_whoami(session: Session, args) -> None:
         print(json.dumps(profile, ensure_ascii=False, indent=2))
         return
     print(f"userId={profile.get('userId')}  手机={profile.get('phone') or '-'}  昵称={profile.get('displayName') or '-'}")
-    print(f"环境={session.base}")
+
 
 
 def cmd_find(session: Session, args) -> None:
@@ -530,12 +527,9 @@ def cmd_transcript(session: Session, args) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    # --env/--base/--json hang off every subcommand (not the top-level parser) so that both
-    # `talktome.py leads --json` and `talktome.py leads --env int` work — writing them after the
-    # subcommand is what anyone (and any model) types first.
+    # --json 挂在每个子命令上（而不是顶层 parser），这样 `talktome.py find … --json` 能用——
+    # 写在子命令后面是所有人（和所有模型）的第一直觉。
     common = argparse.ArgumentParser(add_help=False)
-    common.add_argument("--env", choices=sorted(BASES), default=os.environ.get("TALKTOME_ENV", "prod"))
-    common.add_argument("--base", help="直接指定 API 基址（覆盖 --env，联调用）")
     common.add_argument("--json", action="store_true", help="输出原始 JSON（对话是流式的，不受影响）")
 
     parser = argparse.ArgumentParser(prog="talktome.py", description="按需求找到合适的 TalkToMe 分身并跟它对话")
@@ -580,7 +574,7 @@ COMMANDS = {
 
 def main() -> None:
     args = build_parser().parse_args()
-    session = Session(args.base.rstrip("/") if args.base else BASES[args.env])
+    session = Session()
     try:
         COMMANDS[args.command](session, args)
     except ApiFailure as err:
