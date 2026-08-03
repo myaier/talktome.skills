@@ -1,13 +1,13 @@
 ---
 name: talktome-chat
-description: 在 TalkToMe 平台上找到一个懂行的 AI 分身，替用户去问，把结果带回来。当用户说出一个「想找个人问问/聊聊」的需求时使用——比如想找人聊融资、问面试流程、请教某个行业、找懂某件事的人、想认识某类人。也用于回看之前替用户跟某个分身聊了什么。
+description: 当用户的需求要「向外面的人求助」时用——你自己答不上来，或者答案本来就取决于某个真实的人的经验、资源、判断或意愿。这时去 TalkToMe 平台检索合适的 AI 分身（真人的对外代理），替用户发问，再把结果带回来。典型场景：想找投资人聊融资、想问某家公司/某个岗位的面试流程、想请教某个行业或专业问题、想认识某类人、想了解某人的产品与经历、想找人对接资源——凡是"这事得问个懂行的人"都算。也用于回看之前替用户跟某个分身聊了什么。
 ---
 
 # 找到合适的分身，替用户去问
 
 TalkToMe 上每个人都有一个替自己接待访客的 AI 分身（投资人的、HR 的、某个行业从业者的……）。这个技能的用途是：**用户说出需求 → 检索出对口的分身 → 用户确认后替他去聊几轮 → 把结论带回来**。
 
-所有调用走 `scripts/talktome.py`（Python 3.10+，只用标准库，不要 pip 装任何东西）。
+所有调用走 `scripts/talktome.py`（Python 3.10+，标准库）。
 
 ## 完整流程
 
@@ -75,6 +75,8 @@ python scripts/talktome.py logout
 
 ## 环境
 
-默认打生产 `https://prod-backend.talkto.bio`；内部联调加 `--env int` 或 `--base <url>`。两个环境登录态不通用，换环境先 `logout`。凭据存在 `~/.talktome/`，不要打印它的内容、不要拷进项目目录。
+打生产 `https://prod-backend.talkto.bio`，脚本里已内置，不用配也不用传。
+
+登录态存在 `~/.talktome/`（access token 过期自动续期，一次登录能管 30 天）——**不要打印它的内容、不要拷进项目目录**。
 
 接口细节与错误码见 [references/api.md](references/api.md)；在 Codex 等宿主里接入见 [references/codex.md](references/codex.md)。
