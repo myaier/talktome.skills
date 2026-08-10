@@ -17,8 +17,9 @@
 # Session: ~/.talktome/credentials.json (0600, atomic replace). Access tokens live 1h and are refreshed
 # automatically; the refresh token rotates on every use, so refreshes are serialized behind a lock file —
 # using a rotated-away refresh token twice trips the server's reuse detection and kills the whole session.
-# ~/.talktome/state.json keeps the visitor cookie + the current conversation per agent (that's what
-# `talk` without --new continues).
+# ~/.talktome/state.json keeps every cookie the server sets (the visitor identity, plus the ALB
+# session-affinity cookie that pins both login steps to one backend pod) + the current conversation
+# per agent (that's what `talk` without --new continues).
 #
 # Talking to someone else's agent goes through the VISITOR channel, exactly like a human on
 # talkto.bio/{handle} — so the agent's owner sees the conversation as a lead, with your phone number
@@ -217,34 +218,56 @@ def build_request(base: str, path: str, body: dict, token: str | None, stream: b
         req.add_header("Accept", "text/event-stream")
     if token:
         req.add_header("Authorization", f"Bearer {token}")
-    cookie = visitor_cookie(base)
+    cookie = cookie_header(base)
     if cookie:
         req.add_header("Cookie", cookie)
     return req
 
 
-# ── 访客 cookie ──────────────────────────────────────────────────────────────
-# 跟别人的分身聊走的是访客通道，身份是 HttpOnly 的 ttm_visitor cookie（一个 browserId 通吃所有分身，
-# 服务端按 browserId.agentId 拆出每个分身下的访客行）。浏览器自动带，命令行得自己存：丢了它，
-# 每次 talk 都会变成一个新访客 —— 对方主人的后台会堆出一串各说一句话的"新线索"。
-COOKIE_NAME = "ttm_visitor"
+# ── cookie ───────────────────────────────────────────────────────────────────
+# 命令行没有浏览器的 cookie jar，服务端种什么都得自己存。目前有两条都不能丢，所以这里【不按名字过滤】：
+#   ttm_visitor —— 访客身份。跟别人的分身聊走访客通道，一个 browserId 通吃所有分身（服务端按
+#     browserId.agentId 拆出每个分身下的访客行）。丢了它，每次 talk 都变成一个新访客 ——
+#     对方主人的后台会堆出一串各说一句话的"新线索"。
+#   ALB 会话保持 —— 登录流程（sms/send → sms/verify）的中间态存在 backend 某个 pod 的进程内存里
+#     （backend src/lib/login-client.ts 的 flows Map），多副本下靠这条 cookie 把两步钉在同一个 pod。
+#     丢了它，verify 那步会丢掉上游风控认的浏览器标识，表现为间歇性、不可复现的登录失败。
+#     cookie 名由 ALB 决定（且可能变），所以按名字白名单是错的做法 —— 种什么存什么。
+# ⚠️ login 是分两次【进程】调用的（先 --phone 发码、再 --phone --code 验码），进程内的 jar 活不过
+#    第一次调用，必须落盘 —— 这也是这里不用 http.cookiejar 的原因。
+VISITOR_COOKIE_NAME = "ttm_visitor"
 
 
-def visitor_cookie(base: str) -> str | None:
-    value = read_json_file(STATE_PATH).get("visitorCookies", {}).get(base)
-    return f"{COOKIE_NAME}={value}" if value else None
+def stored_cookies(base: str) -> dict:
+    """这个 base 下已存的 cookie（name → value）。兼容只存过 ttm_visitor 的旧 state.json，
+    免得老用户升级后丢掉访客身份、在对方后台变成一个新线索。"""
+    state = read_json_file(STATE_PATH)
+    jar = state.get("cookies", {}).get(base)
+    if jar:
+        return dict(jar)
+    legacy = state.get("visitorCookies", {}).get(base)
+    return {VISITOR_COOKIE_NAME: legacy} if legacy else {}
+
+
+def cookie_header(base: str) -> str | None:
+    pairs = stored_cookies(base)
+    return "; ".join(f"{name}={value}" for name, value in pairs.items()) or None
 
 
 def remember_cookies(base: str, response) -> None:
-    """从响应里捡出 ttm_visitor 存下来（Set-Cookie 可能有多条，只认这一个）。"""
+    """把响应里所有 Set-Cookie 并进这个 base 的 jar（同名覆盖，本次没提到的保留）。
+    Domain/Path/Max-Age 等属性一律丢弃：这个客户端只跟单一 base 说话，存不下也用不上。"""
+    fresh = {}
     for header in response.headers.get_all("Set-Cookie") or []:
-        first = header.split(";", 1)[0].strip()
-        name, _, value = first.partition("=")
-        if name == COOKIE_NAME and value:
-            state = read_json_file(STATE_PATH)
-            state.setdefault("visitorCookies", {})[base] = value
-            write_json_file(STATE_PATH, state)
-            return
+        name, _, value = header.split(";", 1)[0].strip().partition("=")
+        if name and value:
+            fresh[name] = value
+    if not fresh:
+        return
+    merged = {**stored_cookies(base), **fresh}  # stored_cookies 里含旧格式的迁移
+    state = read_json_file(STATE_PATH)  # 临写前重读：别覆盖同一进程里刚写下的 bound/conversation
+    state.setdefault("cookies", {})[base] = merged
+    write_json_file(STATE_PATH, state)
 
 
 def parse_api_error(err: urllib.error.HTTPError) -> ApiFailure:
