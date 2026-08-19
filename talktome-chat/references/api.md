@@ -21,32 +21,83 @@
 - 502 `SEARCH_UNAVAILABLE` = 服务端算不出向量。**几乎总是配置问题**（`EMBEDDING_API_KEY` 没配、
   或 pod 出不了公网连不到模型端点），不是瞬时故障——重试无用，看 backend 日志的 `[agent-search]` 一行。
 
-## 二、跟别人的分身聊（访客通道）
+## 二、跟 agent 聊（A2A 协议）
 
-和网页上的人类访客走同一条路，只是身份换成了「登录用户 + 访客 cookie」。
+对话走 A2A，**对方是不是 TalkToMe 的分身都一样**：先拿 agent card，再按卡里声明的 `url` 发 JSON-RPC。
+这也是这个技能能跟任意第三方 agent 说话的原因。
 
-| 接口 | 请求 | 说明 |
+### 1. 拿卡
+
+| 目标 | 卡在哪 |
+| --- | --- |
+| TalkToMe 分身 | `https://talkto.bio/{handle}/.well-known/agent-card.json` |
+| 外部 agent | `{origin}/.well-known/agent-card.json`，拿不到再退到旧路径 `/.well-known/agent.json` |
+
+卡里真正要读的三个字段：
+
+- **`url`** —— 对话端点。**只认它，不猜路径**。实测的 A2A 网络里 `/a2a`、`/api/a2a`、`/` 都有人用。
+- `capabilities.streaming` —— 决定用 `message/stream` 还是 `message/send`。
+- `securitySchemes` —— 存在就说明对方要鉴权，我们没有它的凭据，聊不了。
+
+⚠️ 拿到 HTML 而不是 JSON 是常见故障：站点把未知路径兜回了 SPA（HTTP 200 + 一坨 HTML）。脚本会明确报
+「这个地址上没有 agent card」，不要当成 JSON 解析失败去排查对方的 agent。
+
+### 2. 发一轮
+
+`POST {card.url}`，JSON-RPC 2.0：
+
+```jsonc
+{"jsonrpc":"2.0","id":"...","method":"message/stream",   // 或 message/send
+ "params":{"message":{"kind":"message","role":"user","messageId":"...",
+                      "contextId":"<续聊时带上>",
+                      "parts":[{"kind":"text","text":"..."}]}}}
+```
+
+流式响应是 SSE，每帧一个 JSON-RPC 响应对象，`result` 里是事件：
+
+```
+data: {"result":{"kind":"task","id":"...","contextId":"...","status":{"state":"working"}}}
+data: {"result":{"kind":"artifact-update","artifact":{"parts":[{"kind":"text","text":"..."}]},"append":true}}
+data: {"result":{"kind":"status-update","status":{"state":"completed",...},"final":true}}
+```
+
+非流式则一次返回一个 Task。**正文位置有三种写法都要认**：`status.message.parts[]`、`artifacts[].parts[]`、
+或者直接返回一条 `kind:"message"`。
+
+### 3. 会话延续 = `contextId`
+
+首轮不带，服务端签发；之后每轮带上同一个就是接着聊。**脚本按 endpoint 记在本机**（不是按 handle：同一个
+handle 在不同环境是不同的对话）。
+
+TalkToMe 侧的实现细节：contextId 由服务端签发（32 字节随机），**客户端自己编的不会被采纳**——传一个我们
+没签发过的，会开一条新会话并回一个新 id，而不是报错。所以永远以返回的 `contextId` 为准。
+
+### 4. 任务终态
+
+| state | 含义 | 脚本行为 |
 | --- | --- | --- |
-| `/api/public/bind` | `{slug}` | **需登录**。把访客身份绑到账号上，并把账号手机号写进 `visitors.phone` ——对方主人这才拿得到联系方式。每个分身做一次，脚本记在本地 `state.json` |
-| `/api/public/chat` | `{slug, message(≤4000), conversationId?}` | **SSE**，见下。不传 conversationId=新开一条 |
-| `/api/public/history` | `{slug, conversationId, limit?(1..200)}` | `{conversationId, roundCount, messages:[{entryId, role, text, createdAt}]}` |
+| `completed` | 正常答完 | 正常返回 |
+| `auth-required` | 要先注册/登录才能继续 | 退出码 41 |
+| `input-required` | 对方在等你补充 | 正常返回并提示可以接着说 |
+| `failed` / `rejected` / `canceled` | 这轮没成 | 报错退出 |
 
-SSE 帧（`text/event-stream`，每帧一行 `data: {...}`）：
+HTTP 层还有一个：**429 = 对方限流**，响应头 `Retry-After` 给可重试时间。TalkToMe 这边是每个分身每天
+100 轮的 A2A 上限（JSON-RPC error code `-32000`）。别原地重试。
 
-```
-data: {"type":"meta","conversationId":"..."}   # 第一帧，新会话靠它拿 id
-data: {"type":"delta","text":"..."}            # 流式正文
-data: {"type":"gate"}                          # 匿名访客超 5 轮门控 —— 登录后不会出现
-data: {"type":"error","message":"..."}         # 出错（HTTP 仍是 200，流已经开了）
-data: {"type":"done"}
-```
+### 5. 身份与凭据边界
 
-关键机制：
+- **TalkToMe 分身**：带上 `Authorization: Bearer <accessToken>`（可选，卡里 `securitySchemes.talktomeUser`
+  声明了它）。服务端凭它做三件事：解开 5 轮门控、把这条会话的访客行绑到账号、把账号手机号写给对方主人
+  当联系方式。不带就是匿名——能聊 5 轮，但主人只看到「某个 agent 问过」，联系不上。
+  匿名调用还受每分身每天 100 轮的上限；登录后不受该上限。
+- **登录 token 只发给 talkto.bio / prod-backend.talkto.bio 这两个 origin**（`is_talktome_origin()`）。
+  一个"通用" A2A 客户端如果给每个 endpoint 都带 Authorization，等于把用户凭据交给他聊过的每个陌生 agent。
+- 失败**不要自动重发**——消息可能已经到达对面。
 
-- **访客身份 = `ttm_visitor` cookie**（HttpOnly，一个 browserId 通吃所有分身，服务端按 `browserId.agentId` 拆出每个分身下的访客行）。命令行必须自己存，丢了就变成新访客——对方主人的后台会堆出一串各说一句话的"新线索"。
-- **5 轮匿名门控**：带着有效登录 token 就自动放开，所以流程要求先登录。
-- **每次对话都会在对方主人后台产生一条真实线索**：`visitors` 行 + 轮数 + 未读标记，会话结束后还会被 AI 摘要成要点。所以第一句要交代来意，也不要空聊。
-- 失败**不要自动重发**——消息可能已经到达对面分身。
+### 6. 读历史
+
+A2A 没有"读历史"这个方法（`tasks/get` 只针对未完成的任务，TalkToMe 这边完成即丢）。所以 `transcript`
+读的是**本机记录**：每轮的发送与回复存在 `~/.talktome/state.json`，换台机器就没有了。
 
 ## 三、登录
 
@@ -81,5 +132,15 @@ access token 1 小时过期；refresh token 30 天滑动续期（每次轮换重
 | 428 | `CAPTCHA_REQUIRED` | 退出码 42，请用户去 App 登一次 |
 | 502 | `SEARCH_UNAVAILABLE` | 服务端配置/依赖问题，**别重试**，告诉用户联系管理员 |
 | 502 | `XCHAT_UNAVAILABLE` | 对话服务不可用，不自动重发消息 |
+
+A2A 侧（JSON-RPC，HTTP 通常是 200，错误在 body 的 `error.code` 里，是**数字**）：
+
+| code | 含义 | 处理 |
+| --- | --- | --- |
+| -32000 | 对方限流（TalkToMe = 每分身每天 100 轮） | HTTP 429 + `Retry-After`，别原地重试 |
+| -32600 / -32601 / -32602 | 信封/方法/参数不对 | 我们这边的 bug，不要重试 |
+| -32005 | 对方只收 text/plain，我们发了别的 | 不要重试 |
+| -32001 | 任务查不到（TalkToMe 完成即丢） | 正常，不影响对话 |
+| -32603 | 对方内部错误 | 报告用户，不自动重发
 
 非流式请求在 5xx / 网络故障时自动退避重试 2 次（1s、4s）；SSE 不重试。
