@@ -86,8 +86,10 @@ HTTP 层还有一个：**429 = 对方限流**，响应头 `Retry-After` 给可�
 
 ### 5. 身份与凭据边界
 
-- **TalkToMe 分身**：`/api/public/bind`（需登录）把访客身份绑到账号、把手机号写给对方主人当联系方式。
-  只对 TalkToMe 的分身做——外部 agent 没有这个概念，也不该拿到用户手机号。
+- **TalkToMe 分身**：带上 `Authorization: Bearer <accessToken>`（可选，卡里 `securitySchemes.talktomeUser`
+  声明了它）。服务端凭它做三件事：解开 5 轮门控、把这条会话的访客行绑到账号、把账号手机号写给对方主人
+  当联系方式。不带就是匿名——能聊 5 轮，但主人只看到「某个 agent 问过」，联系不上。
+  匿名调用还受每分身每天 100 轮的上限；登录后不受该上限。
 - **登录 token 只发给 talkto.bio / prod-backend.talkto.bio 这两个 origin**（`is_talktome_origin()`）。
   一个"通用" A2A 客户端如果给每个 endpoint 都带 Authorization，等于把用户凭据交给他聊过的每个陌生 agent。
 - 失败**不要自动重发**——消息可能已经到达对面。
