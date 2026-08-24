@@ -17,6 +17,7 @@ description: 制作并发布 TalkToMe 分身——把用户的知识和资料变
    <名字>/
    ├── soul.md        # 人设，第一人称，≤2000 字
    ├── greeting.md    # 开场白 ≤300 字
+   ├── avatar.png     # 可选：分身头像，jpg/png/webp，≤5MB
    ├── knowledge/     # 素材整理成的知识文档
    └── skills/        # 可选：要固化方法论时才做
    ```
@@ -25,6 +26,7 @@ description: 制作并发布 TalkToMe 分身——把用户的知识和资料变
    - **greeting.md**：说清能做什么 + 引导访客说第一句话。
    - **knowledge/**：素材按主题拆成若干 .md，**平铺、自描述文件名**（上传不支持子目录）；聊天/讨论类素材要整理成文档（去闲聊、相对日期改绝对日期、按主题归并），不要直接扔原始记录。
    - **skills/** 仅当需要固化一套"怎么干活"的方法论时才做；每个技能一个子目录，`SKILL.md` 必须带 frontmatter `name`/`description`。
+   - **头像**：用户给了图就放成目录下的 `avatar.png`/`.jpg`/`.jpeg`/`.webp`（部署时自动上传），或部署时 `--avatar <路径>` 指定；**不要自己生成或找图**，没有就不放，用户之后可以在 App 里传。
 3. **把 soul.md 和 greeting.md 草稿给用户过目**，确认后继续。
 
 ## 第二步：登录（拿 accessToken）
@@ -46,7 +48,9 @@ API 基址 `https://prod-backend.talkto.bio`：
 python scripts/deploy.py --src <分身目录>
 ```
 
-必填只有两样：**名字**（`--name`，或目录里 config.yaml 的 `name:`，或目录名兜底）和**非空的 soul.md**。开场白、知识库、技能都可以没有——缺了就跳过，不报错。
+必填只有两样：**名字**（`--name`，或目录里 config.yaml 的 `name:`，或目录名兜底）和**非空的 soul.md**。开场白、头像、知识库、技能都可以没有——缺了就跳过，不报错。
+
+头像：目录里有 `avatar.png`/`.jpg`/`.jpeg`/`.webp` 就自动上传，也可以 `--avatar <图片路径>` 指向目录外的图（jpg/png/webp，≤5MB，其他格式服务端会拒）。换头像只要替换这张图再重跑一次部署命令即可；图没变则跳过不重传。
 
 脚本会自动完成：创建分身 → 知识库摊平上传（预查重名）→ 技能逐文件上传（校验 SKILL.md frontmatter，warnings 非空要修）→ 拉取清单核对。**增量上传**：重跑时按内容哈希（服务端 etag）跳过未变化的文件，只传新增/有改动的，中断后重跑即续传。接口路径与限额等细节都在脚本头部注释里，排障时读脚本即可。
 

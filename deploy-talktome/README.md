@@ -6,7 +6,7 @@ Claude Code 技能：把你的资料做成 [TalkToMe](https://talkto.bio) 分身
 
 给它一堆文件、笔记或一段讨论，说"做成一个 talktome 分身"，它会：
 
-1. 整理素材，起草人设（soul）、开场白（greeting）、知识库文档——草稿经你确认
+1. 整理素材，起草人设（soul）、开场白（greeting）、知识库文档——草稿经你确认（头像你自己给图，放进分身目录即可）
 2. 走你的手机号登录 TalkToMe，创建分身并上传知识库/技能
 3. 你确认主页名（handle）和发布后，把 `talkto.bio/{handle}` 链接交给你测试
 
@@ -33,7 +33,8 @@ cp -r deploy-talktome <project>/.claude/skills/deploy-talktome
 也可以直接跑部署脚本（零依赖，Python 3.9+；token 通过技能里的手机号登录流程获取）：
 
 ```bash
-python scripts/deploy.py --src <分身目录>
+python scripts/deploy.py --src <分身目录>                  # 目录里的 avatar.png/jpg/webp 会一并作为头像上传
+python scripts/deploy.py --src <分身目录> --avatar <图片>   # 或显式指定一张头像
 python scripts/deploy.py --agent-id <uuid> --set-handle <名字>
 python scripts/deploy.py --agent-id <uuid> --publish
 ```
