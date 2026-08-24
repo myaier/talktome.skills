@@ -404,6 +404,19 @@ def main() -> None:
         print(f"[knowledge] {name} ({r['file']['size']}B)")
     if kn_skipped:
         print(f"[knowledge] {kn_skipped} unchanged files skipped")
+    # Migration guard: a pre-folders skill flattened every doc to its basename, so a persona dir that
+    # HAS subfolders re-deploys those docs to new nested names while the old flat copies stay at the
+    # root — the agent then reads both. Detect: a nested local doc whose basename exists remotely at
+    # the root, with no local root file legitimately owning that name.
+    if remote_kn:
+        local_root_names = {p.name for p in kfiles if "/" not in remote_name(p)}
+        stale = sorted({p.name for p in kfiles
+                        if "/" in remote_name(p) and p.name in remote_kn and p.name not in local_root_names})
+        if stale:
+            shown = ", ".join(stale[:5]) + ("…" if len(stale) > 5 else "")
+            print(f"[knowledge] WARNING: {len(stale)} doc(s) still have a FLAT copy at the root from a "
+                  f"pre-folders deploy ({shown}); the agent reads both copies — "
+                  f"re-run once with --replace-knowledge to clean up")
 
     # skills: optional dir; nested paths preserved
     sdir = src / "skills"
