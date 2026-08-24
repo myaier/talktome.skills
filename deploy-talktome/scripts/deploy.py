@@ -33,9 +33,10 @@
 #   /api/agents/avatar   {agentId, base64, contentType}  agent avatar -> public-read OSS, {agent, url}
 #                                                   jpeg/png/webp only, <=5MB decoded (server-enforced)
 #   /api/handles/check   {handle}                   -> {available, reason?, suggestion?}
-#   /api/knowledge-docs/upload?agentId=&filename=   raw file bytes; filename must not contain '/'
+#   /api/knowledge-docs/upload?agentId=&filename=   raw file bytes; docs: filename may be a folder path
+#                                                   ("dir/sub/doc.md"); images: single segment only
 #                                                   (images are OCR'd into readable text automatically)
-#   /api/knowledge-docs/delete {agentId, filename, isImage?}
+#   /api/knowledge-docs/delete {agentId, filename, isImage?}    docs: folder path ok
 #   /api/agent-skills/upload?agentId=&skillName=&path=   raw file bytes; path may contain subdirs
 #       limits: 2MB/file, 100 files and 20MB total per agent; skillName matches ^[a-z0-9][a-z0-9_-]{0,63}$
 #   /api/agent-skills/delete {agentId, skillName}   deletes the whole skill — used by --replace-skills, because
@@ -204,7 +205,7 @@ def main() -> None:
     if args.show:
         agent_id = resolve_agent_id(required=True)
         agent = post_json("/api/agents/get", {"agentId": agent_id})["agent"]
-        kn = post_json("/api/knowledge-docs/list", {"agentId": agent_id})["files"]
+        kn = post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})["files"]
         sk = post_json("/api/agent-skills/list", {"agentId": agent_id})["skills"]
         print(f"name:      {agent.get('agent_name')}")
         print(f"agentId:   {agent.get('id')}")
@@ -359,34 +360,48 @@ def main() -> None:
             write_manifest({"avatarMd5": avatar_md5})
             print(f"[avatar] {avatar_path.name} ({len(avatar_bytes)}B) -> {r['url']}")
 
-    # knowledge: optional dir; flattened to basenames (the API rejects '/' in filenames)
+    # knowledge: optional dir. Docs keep their folder structure (the API accepts relative paths since
+    # 2026-08-24); images are FLATTENED to basenames — the server stores every image in its flat system
+    # image/ dir, so an image's remote name is always its basename regardless of the local subfolder.
     kdir = src / "knowledge"
     kfiles = sorted(p for p in kdir.rglob("*") if p.is_file()) if kdir.is_dir() else []
-    names = [p.name for p in kfiles]
-    dupes = {n for n in names if names.count(n) > 1}
+
+    def is_image_file(p: Path) -> bool:
+        return upload_mime(p).startswith("image/")
+
+    def remote_name(p: Path) -> str:
+        return p.name if is_image_file(p) else p.relative_to(kdir).as_posix()
+
+    # collision check is only needed where names still flatten: images
+    img_names = [p.name for p in kfiles if is_image_file(p)]
+    dupes = {n for n in img_names if img_names.count(n) > 1}
     if dupes:
-        sys.exit(f"flattening collision in knowledge/: {sorted(dupes)}")
+        sys.exit(f"flattening collision among images in knowledge/: {sorted(dupes)}")
     remote_kn: dict = {}
+    # includeNested: needed to see docs inside folders (old servers strip the unknown field and just
+    # return the top level — then nested docs re-upload every run and --replace can't delete them;
+    # a nested UPLOAD against an old server fails with BAD_FILENAME: deploy the new backend first).
     if args.replace_knowledge:
-        old = post_json("/api/knowledge-docs/list", {"agentId": agent_id})["files"]
+        old = post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})["files"]
         for f in old:
             post_json("/api/knowledge-docs/delete",
                       {"agentId": agent_id, "filename": f["filename"], "isImage": f.get("isImage", False)})
         print(f"[knowledge] deleted {len(old)} old files")
     elif kfiles:
         remote_kn = {f["filename"]: etag_of(f)
-                     for f in post_json("/api/knowledge-docs/list", {"agentId": agent_id})["files"]}
+                     for f in post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})["files"]}
     kn_skipped = 0
     for p in kfiles:
         data = p.read_bytes()
-        if remote_kn.get(p.name) == md5_hex(data):
+        name = remote_name(p)
+        if remote_kn.get(name) == md5_hex(data):
             kn_skipped += 1
             continue
         r = call(
-            f"/api/knowledge-docs/upload?agentId={agent_id}&filename={urllib.parse.quote(p.name)}",
+            f"/api/knowledge-docs/upload?agentId={agent_id}&filename={urllib.parse.quote(name)}",
             data, upload_mime(p),
         )
-        print(f"[knowledge] {p.name} ({r['file']['size']}B)")
+        print(f"[knowledge] {name} ({r['file']['size']}B)")
     if kn_skipped:
         print(f"[knowledge] {kn_skipped} unchanged files skipped")
 
@@ -428,7 +443,7 @@ def main() -> None:
             print(f"[skill] {skill_name}: {sk_skipped} unchanged files skipped")
 
     # verify
-    kn = post_json("/api/knowledge-docs/list", {"agentId": agent_id})
+    kn = post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})
     sk = post_json("/api/agent-skills/list", {"agentId": agent_id})
     print(f"\n[verify] knowledge: {len(kn['files'])} files")
     for s in sk["skills"]:
