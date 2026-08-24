@@ -10,11 +10,13 @@
 #
 # Usage (token is read from <skill>/.env once saved — pass --token only to override):
 #   save session:   python deploy.py --save-token <accessToken> <refreshToken>     # right after the SMS login
-#   deploy:         python deploy.py --src <persona-dir> [--name <n>]
+#   deploy:         python deploy.py --src <persona-dir> [--name <n>] [--avatar <img>]
 #   resume/update:  python deploy.py --src <persona-dir>                           # agentId auto-read from .talktome.json
 #                     [--update-persona]     also push name/soul/greeting changes to the existing agent
 #                     [--replace-skills]     delete each skill first (use when skill files were renamed/removed)
 #                     [--replace-knowledge]  delete existing knowledge files first (same reason)
+#   avatar:         put avatar.png|jpg|jpeg|webp in the persona dir (auto-picked up), or pass --avatar <path>;
+#                   uploaded on every deploy run, skipped when the file's md5 matches the last upload
 #   set handle:     python deploy.py --src <dir> --set-handle <slug>               # checked first; SET ONCE, locked after
 #                     (also sets the agent's email address to <slug>@talkto.bio — same slug, confirmed together;
 #                      re-run with the SAME slug to repair older agents that got a handle but no email)
@@ -28,6 +30,8 @@
 #   /api/agents/update   {agentId, agentName?, soulContent?, greeting?, handle?, emailLocalpart?}
 #                                                   handle+emailLocalpart can each be set ONCE (then locked)
 #   /api/agents/publish  {agentId}                  makes talkto.bio/{handle} public; requires handle
+#   /api/agents/avatar   {agentId, base64, contentType}  agent avatar -> public-read OSS, {agent, url}
+#                                                   jpeg/png/webp only, <=5MB decoded (server-enforced)
 #   /api/handles/check   {handle}                   -> {available, reason?, suggestion?}
 #   /api/knowledge-docs/upload?agentId=&filename=   raw file bytes; filename must not contain '/'
 #                                                   (images are OCR'd into readable text automatically)
@@ -38,6 +42,7 @@
 #                                                   the platform sync is additive (renamed/removed files would linger)
 #   /api/knowledge-docs/list, /api/agent-skills/list  {agentId}  -> verification
 import argparse
+import base64 as b64
 import hashlib
 import json
 import mimetypes
@@ -50,6 +55,9 @@ from pathlib import Path
 
 DEFAULT_BASE = "https://prod-backend.talkto.bio"
 SKIP_SKILL_DIRS = {"scripts"}  # skill script files are not used in online chat; skip to keep the sync light
+# Avatar formats the backend accepts (POST /api/agents/avatar); keys double as the auto-detect extensions
+AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+AVATAR_MAX_BYTES = 5 * 1024 * 1024  # server limit; check locally so an oversized file fails before the upload
 
 # Session storage: <skill-dir>/.env (gitignored). Written after the SMS login, then reused by every run —
 # --token is only needed to override. Keys: TALKTOME_ACCESS_TOKEN / TALKTOME_REFRESH_TOKEN.
@@ -81,6 +89,8 @@ def main() -> None:
     ap.add_argument("--src", help="persona dir (soul.md required; greeting/knowledge/skills optional)")
     ap.add_argument("--agent-id", help="existing agent uuid (resume/update/set-handle/publish)")
     ap.add_argument("--name", help="agent name (default: name: in config.yaml if present, else dir name)")
+    ap.add_argument("--avatar",
+                    help="agent avatar image (jpg/png/webp, <=5MB); default: avatar.<ext> in --src if present")
     ap.add_argument("--update-persona", action="store_true",
                     help="with --agent-id: also push name/soul/greeting from --src to the existing agent")
     ap.add_argument("--set-handle", help="check + set the homepage slug (talkto.bio/{handle}); SET ONCE, locked after")
@@ -203,6 +213,7 @@ def main() -> None:
         print(f"status:    {agent.get('status')}")
         email = agent.get("email_localpart")
         print(f"email:     {email + '@talkto.bio' if email else '(not set)'}")
+        print(f"avatar:    {agent.get('avatar_url') or '(not set)'}")
         print(f"updated:   {agent.get('updated_at')}")
         soul = agent.get("soul_content") or ""
         greeting = agent.get("greeting") or ""
@@ -291,6 +302,26 @@ def main() -> None:
         # send JSON files as an opaque byte stream so intermediate JSON body parsers never touch them
         return "application/octet-stream" if mime == "application/json" else mime
 
+    # incremental resume: the server's ETag is the file's MD5 (single-shot uploads), so unchanged files are skipped
+    def md5_hex(data: bytes) -> str:
+        return hashlib.md5(data).hexdigest().lower()
+
+    def etag_of(f: dict) -> str:
+        return (f.get("etag") or "").strip('"').lower()
+
+    def resolve_avatar() -> Path | None:
+        """--avatar wins; otherwise avatar.<ext> sitting in the persona dir (same convention as soul.md)."""
+        if args.avatar:
+            p = Path(args.avatar)
+            if not p.is_file():
+                sys.exit(f"avatar not found: {p}")
+            return p
+        hits = sorted(p for p in src.iterdir()
+                      if p.is_file() and p.stem.lower() == "avatar" and p.suffix.lower() in AVATAR_TYPES)
+        if len(hits) > 1:
+            sys.exit(f"multiple avatar files in {src}: {[p.name for p in hits]} — keep one, or pass --avatar")
+        return hits[0] if hits else None
+
     agent_id = resolve_agent_id(required=False)
     if agent_id:
         print(f"[reuse] agentId={agent_id}")
@@ -306,6 +337,28 @@ def main() -> None:
         write_manifest({"agentId": agent_id, "name": persona["agentName"]})
         print(f"[create] agentId={agent_id} name={persona['agentName']} soulChars={len(persona['soulContent'])}")
 
+    # avatar: optional; each upload writes a NEW object key, so skip when the file's md5 matches the
+    # last one we sent (recorded in .talktome.json) — keeps re-runs from piling up dead objects on OSS
+    avatar_path = resolve_avatar()
+    if avatar_path:
+        content_type = AVATAR_TYPES.get(avatar_path.suffix.lower())
+        if not content_type:
+            sys.exit(f"unsupported avatar type: {avatar_path.name} (only jpg/jpeg/png/webp)")
+        avatar_bytes = avatar_path.read_bytes()
+        if len(avatar_bytes) > AVATAR_MAX_BYTES:
+            sys.exit(f"avatar too large ({len(avatar_bytes)}B > 5MB): {avatar_path} — compress it first")
+        avatar_md5 = md5_hex(avatar_bytes)
+        if read_manifest().get("avatarMd5") == avatar_md5:
+            print(f"[avatar] {avatar_path.name} unchanged, skipped")
+        else:
+            r = post_json("/api/agents/avatar", {
+                "agentId": agent_id,
+                "base64": b64.b64encode(avatar_bytes).decode("ascii"),
+                "contentType": content_type,
+            })
+            write_manifest({"avatarMd5": avatar_md5})
+            print(f"[avatar] {avatar_path.name} ({len(avatar_bytes)}B) -> {r['url']}")
+
     # knowledge: optional dir; flattened to basenames (the API rejects '/' in filenames)
     kdir = src / "knowledge"
     kfiles = sorted(p for p in kdir.rglob("*") if p.is_file()) if kdir.is_dir() else []
@@ -313,13 +366,6 @@ def main() -> None:
     dupes = {n for n in names if names.count(n) > 1}
     if dupes:
         sys.exit(f"flattening collision in knowledge/: {sorted(dupes)}")
-    # incremental resume: the server's ETag is the file's MD5 (single-shot uploads), so unchanged files are skipped
-    def md5_hex(data: bytes) -> str:
-        return hashlib.md5(data).hexdigest().lower()
-
-    def etag_of(f: dict) -> str:
-        return (f.get("etag") or "").strip('"').lower()
-
     remote_kn: dict = {}
     if args.replace_knowledge:
         old = post_json("/api/knowledge-docs/list", {"agentId": agent_id})["files"]
