@@ -33,10 +33,10 @@
 #   /api/agents/avatar   {agentId, base64, contentType}  agent avatar -> public-read OSS, {agent, url}
 #                                                   jpeg/png/webp only, <=5MB decoded (server-enforced)
 #   /api/handles/check   {handle}                   -> {available, reason?, suggestion?}
-#   /api/knowledge-docs/upload?agentId=&filename=   raw file bytes; docs: filename may be a folder path
+#   /api/knowledge-docs/upload?agentId=&filename=   raw file bytes; filename may be a folder path
 #                                                   ("dir/sub/doc.md"); images: single segment only
 #                                                   (images are OCR'd into readable text automatically)
-#   /api/knowledge-docs/delete {agentId, filename, isImage?}    docs: folder path ok
+#   /api/knowledge-docs/delete {agentId, filename, isImage?}    folder path ok
 #   /api/agent-skills/upload?agentId=&skillName=&path=   raw file bytes; path may contain subdirs
 #       limits: 2MB/file, 100 files and 20MB total per agent; skillName matches ^[a-z0-9][a-z0-9_-]{0,63}$
 #   /api/agent-skills/delete {agentId, skillName}   deletes the whole skill — used by --replace-skills, because
@@ -360,27 +360,22 @@ def main() -> None:
             write_manifest({"avatarMd5": avatar_md5})
             print(f"[avatar] {avatar_path.name} ({len(avatar_bytes)}B) -> {r['url']}")
 
-    # knowledge: optional dir. Docs keep their folder structure (the API accepts relative paths since
-    # 2026-08-24); images are FLATTENED to basenames — the server stores every image in its flat system
-    # image/ dir, so an image's remote name is always its basename regardless of the local subfolder.
+    # knowledge: optional dir. Every file — documents AND images — keeps its folder structure: the
+    # remote name is just the path relative to knowledge/. Images live under the server's system image/
+    # subtree, but that is storage layout, not the user-facing name: image/{dir}/{img.png} is addressed
+    # as {dir}/{img.png} everywhere in the API, exactly like a doc. Nothing flattens any more, so there
+    # is no name-collision case left to check — two same-named files in different folders stay distinct.
     kdir = src / "knowledge"
     kfiles = sorted(p for p in kdir.rglob("*") if p.is_file()) if kdir.is_dir() else []
 
-    def is_image_file(p: Path) -> bool:
-        return upload_mime(p).startswith("image/")
-
     def remote_name(p: Path) -> str:
-        return p.name if is_image_file(p) else p.relative_to(kdir).as_posix()
-
-    # collision check is only needed where names still flatten: images
-    img_names = [p.name for p in kfiles if is_image_file(p)]
-    dupes = {n for n in img_names if img_names.count(n) > 1}
-    if dupes:
-        sys.exit(f"flattening collision among images in knowledge/: {sorted(dupes)}")
+        return p.relative_to(kdir).as_posix()
     remote_kn: dict = {}
-    # includeNested: needed to see docs inside folders (old servers strip the unknown field and just
-    # return the top level — then nested docs re-upload every run and --replace can't delete them;
+    # includeNested: needed to see files inside folders (old servers strip the unknown field and just
+    # return the top level — then nested files re-upload every run and --replace can't delete them;
     # a nested UPLOAD against an old server fails with BAD_FILENAME: deploy the new backend first).
+    # Server-side history, in case a deploy hits an in-between build: docs got folders on 2026-08-24,
+    # images on 2026-08-25 (backend aebdd19 — before that, an image path with '/' is rejected).
     if args.replace_knowledge:
         old = post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})["files"]
         for f in old:
@@ -404,9 +399,9 @@ def main() -> None:
         print(f"[knowledge] {name} ({r['file']['size']}B)")
     if kn_skipped:
         print(f"[knowledge] {kn_skipped} unchanged files skipped")
-    # Migration guard: a pre-folders skill flattened every doc to its basename, so a persona dir that
-    # HAS subfolders re-deploys those docs to new nested names while the old flat copies stay at the
-    # root — the agent then reads both. Detect: a nested local doc whose basename exists remotely at
+    # Migration guard: a pre-folders skill flattened every file to its basename, so a persona dir that
+    # HAS subfolders re-deploys those files to new nested names while the old flat copies stay at the
+    # root — the agent then reads both. Detect: a nested local file whose basename exists remotely at
     # the root, with no local root file legitimately owning that name.
     if remote_kn:
         local_root_names = {p.name for p in kfiles if "/" not in remote_name(p)}
@@ -414,7 +409,7 @@ def main() -> None:
                         if "/" in remote_name(p) and p.name in remote_kn and p.name not in local_root_names})
         if stale:
             shown = ", ".join(stale[:5]) + ("…" if len(stale) > 5 else "")
-            print(f"[knowledge] WARNING: {len(stale)} doc(s) still have a FLAT copy at the root from a "
+            print(f"[knowledge] WARNING: {len(stale)} file(s) still have a FLAT copy at the root from a "
                   f"pre-folders deploy ({shown}); the agent reads both copies — "
                   f"re-run once with --replace-knowledge to clean up")
 
