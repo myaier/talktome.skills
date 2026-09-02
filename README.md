@@ -145,6 +145,7 @@ python ~/.claude/skills/talktome-chat/scripts/talktome.py whoami   # 退出码 4
 
 - `talktome-chat` → `~/.talktome/credentials.json`。一次登录管 30 天，access token 自动续期，**多个宿主共用同一份**（串行使用没问题，别两个宿主同时发命令）。可用环境变量 `TALKTOME_HOME=<目录>` 换位置，**别指到任何被 git 追踪的目录**。
 - `deploy-talktome` → **技能目录自己的 `.env`**（已在 `.gitignore` 里）。因此该技能目录必须**可写**，别装到只读位置；用方式 B 软链安装时，`.env` 实际落在本仓库目录里，同样被 gitignore 挡住。
+  登录推荐让用户**自己在终端里**跑 `python <技能目录>/scripts/login.py`——交互式，手机号和验证码只在本机输入，两个长期 token 不经过 agent 的对话上下文；agent 代跑收不到键盘输入，会卡住。宿主跑不了交互脚本时，再退回 `SKILL.md` 第二步的手工 API 流程。
 - 两者都不要打印 token 内容，也不要把凭据文件拷进项目目录。
 
 ## 六、更新 / 卸载
