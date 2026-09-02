@@ -33,13 +33,31 @@ description: 制作并发布 TalkToMe 分身——把用户的知识和资料变
 
 API 基址 `https://prod-backend.talkto.bio`：
 
-**先看有没有存过会话**：技能目录下 `.env` 里有 `TALKTOME_ACCESS_TOKEN` 就直接跳过登录（过期了脚本会自动用 refreshToken 续期并回写）。没有才走：
+**先看有没有存过会话**：技能目录下 `.env` 里有 `TALKTOME_ACCESS_TOKEN` 就直接跳过登录（过期了脚本会自动用 refreshToken 续期并回写）。没有才走下面两条路之一。
+
+### 推荐：把登录脚本交给用户自己跑
+
+```bash
+python scripts/login.py
+```
+
+**把这条命令给用户，让他在自己的终端里执行，agent 不要代跑**——脚本靠 `input()` 收手机号和验证码，agent 代跑拿不到用户的键盘输入，只会卡住。用户跑完会话就写进技能目录 `.env` 了，他回来说一声即可继续第三步。
+
+这条路的好处是**验证码和两个长期 token 全程只在用户本机进程内流转**，不进对话记录、不进 shell history。`source` 兼容、60 秒限流提示、代理排障提示都在脚本里处理好了，agent 不用管细节。
+
+### 兜底：agent 手工调 API
+
+仅当用户的宿主跑不了交互式脚本（沙箱没有 stdin 等）时才用。这条路需要用户把验证码报给 agent：
 
 1. 问用户手机号 → `POST /api/auth/sms/send` body `{"phone":"<手机号>","cc":"86"}`
 2. 问用户收到的验证码 → `POST /api/auth/sms/verify` body `{"phone":"...","cc":"86","code":"...","source":"skill"}` → 响应含 `accessToken` / `refreshToken` / `expiresIn`
 3. **立刻存下会话**：`python scripts/deploy.py --save-token <accessToken> <refreshToken>`——写进技能目录 `.env`（已 gitignore），之后所有命令不用再传 token
 
-- **新用户无需注册**：没注册过的手机号走同一流程自动建号（响应里 `isNewUser: true`）。`"source":"skill"` 是本渠道的注册归因标记，默认带上；若 verify 返回 400 提示 source 枚举不认 `skill`（旧版服务端），**去掉 source 字段重发同一个验证码即可**（验证码没有被消耗），登录照常，只是这次注册不带渠道归因。
+走这条路要**主动告诉用户**：验证码和两个 token 会经过对话上下文，留在会话记录里。
+
+### 两条路都适用
+
+- **新用户无需注册**：没注册过的手机号走同一流程自动建号（响应里 `isNewUser: true`）。`"source":"skill"` 是本渠道的注册归因标记，默认带上；若 verify 返回 400 提示 source 枚举不认 `skill`（旧版服务端），**去掉 source 字段重发同一个验证码即可**（验证码没有被消耗），登录照常，只是这次注册不带渠道归因。`login.py` 已内置这个重试。
 - 同一手机号两次发送验证码**至少间隔 60 秒**；发送失败不要自动重试，先告知用户再定。
 
 ## 第三步：部署（跑自带脚本）

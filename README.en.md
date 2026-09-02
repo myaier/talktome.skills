@@ -149,6 +149,7 @@ python ~/.claude/skills/talktome-chat/scripts/talktome.py whoami   # exit code 4
 
 - `talktome-chat` → `~/.talktome/credentials.json`. One login lasts 30 days, the access token refreshes automatically, and **all hosts share the same file** (fine sequentially — just don't drive two hosts at once). Set `TALKTOME_HOME=<dir>` to relocate it, but **never point it at a git-tracked directory**.
 - `deploy-talktome` → **`.env` inside its own skill directory** (already gitignored). That directory must therefore be **writable** — don't install it read-only. With Option B, the `.env` lands in this repo and stays gitignored.
+  To log in, have the user run `python <skill-dir>/scripts/login.py` **themselves in their own terminal** — it is interactive, so the phone number and SMS code are typed locally and neither long-lived token ever passes through the agent's context. An agent running it on the user's behalf gets no keyboard input and just hangs. Fall back to the manual API flow in `SKILL.md` step 2 only when the host cannot run interactive scripts.
 - Never print token contents, and never copy credential files into a project directory.
 
 ## 6. Update / uninstall
