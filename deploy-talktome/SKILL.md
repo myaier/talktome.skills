@@ -27,7 +27,9 @@ description: 制作并发布 TalkToMe 分身——把用户的知识和资料变
    - **knowledge/**：素材按主题拆成若干 .md，文件名自描述；**支持子目录分层**（如 `knowledge/产品/定价.md`），主题多时按文件夹归类。图片和文档一样分层，不同文件夹下同名文件互不冲突。聊天/讨论类素材要整理成文档（去闲聊、相对日期改绝对日期、按主题归并），不要直接扔原始记录。
    - **skills/** 仅当需要固化一套"怎么干活"的方法论时才做；每个技能一个子目录，`SKILL.md` 必须带 frontmatter `name`/`description`。
    - **头像**：用户给了图就放成目录下的 `avatar.png`/`.jpg`/`.jpeg`/`.webp`（部署时自动上传），或部署时 `--avatar <路径>` 指定；**不要自己生成或找图**，没有就不放，用户之后可以在 App 里传。
-3. **把 soul.md 和 greeting.md 草稿给用户过目**，确认后继续。
+3. 读取新增本地资料前，询问具体允许读取的目录、文件和记忆来源。读取授权不等于上传授权。首个 Agent 默认是用户对外的 AI 名片，只保留用户确认可公开的事实、项目、能力和联系方式。
+4. **把全部上传内容（人设、开场白、名片文案、头像、知识摘要、技能）给用户过目**，列出排除的私人数据，确认上传及公开范围后继续。不要编造履历或承诺。
+5. 可选 `card.json` 保存用户确认的 `shareIntro`、`shareTags`、`socials`，部署时写入展示资料。具体字段、限制和接口见 [references/api.md](references/api.md)。
 
 ## 第二步：登录（拿 accessToken）
 
@@ -45,15 +47,9 @@ python scripts/login.py
 
 这条路的好处是**验证码和两个长期 token 全程只在用户本机进程内流转**，不进对话记录、不进 shell history。`source` 兼容、60 秒限流提示、代理排障提示都在脚本里处理好了，agent 不用管细节。
 
-### 兜底：agent 手工调 API
+### 宿主无法交互时
 
-仅当用户的宿主跑不了交互式脚本（沙箱没有 stdin 等）时才用。这条路需要用户把验证码报给 agent：
-
-1. 问用户手机号 → `POST /api/auth/sms/send` body `{"phone":"<手机号>","cc":"86"}`
-2. 问用户收到的验证码 → `POST /api/auth/sms/verify` body `{"phone":"...","cc":"86","code":"...","source":"skill"}` → 响应含 `accessToken` / `refreshToken` / `expiresIn`
-3. **立刻存下会话**：`python scripts/deploy.py --save-token <accessToken> <refreshToken>`——写进技能目录 `.env`（已 gitignore），之后所有命令不用再传 token
-
-走这条路要**主动告诉用户**：验证码和两个 token 会经过对话上下文，留在会话记录里。
+请用户在自己的可交互终端运行上述脚本后再继续。不要把 accessToken / refreshToken 放进聊天、命令参数或日志；不要使用旧的 `--save-token` 参数示例。短信验证或会话刷新失败时保留本地草稿，不自动反复发送验证码。
 
 ### 两条路都适用
 
@@ -110,3 +106,13 @@ python scripts/deploy.py --src <目录>
 
 - 知识/技能改动对**新会话**生效（进行中的会话不热更新）
 - 分身使用平台统一的对话模型，分身目录里的模型配置不影响线上
+
+## 最后：交付小程序二维码卡片
+
+发布成功后执行：
+
+```bash
+python scripts/deploy.py --src <分身目录> --card <输出目录>/talktome-card.png
+```
+
+这会调用 `/api/agents/miniprogram-card`，保存真实微信小程序码组成的 PNG 名片；默认正式版，联调可指定 `--card-env develop`。详细契约见 [references/api.md](references/api.md)。通过宿主图片/附件能力把图片直接发给用户，并附主页链接，请用户微信扫码核对。失败须报告并重试同一个 Agent，不能用网页二维码代替，也不能只发 base64 或声称已完成。

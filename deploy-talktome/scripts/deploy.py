@@ -8,8 +8,8 @@
 # run on the same dir picks it up — users only ever refer to the agent by name/dir. --agent-id overrides;
 # --list recovers a lost mapping (match by name).
 #
-# Usage (token is read from <skill>/.env once saved — pass --token only to override):
-#   save session:   python deploy.py --save-token <accessToken> <refreshToken>     # right after the SMS login
+# Usage (tokens stay in <skill>/.env; let the user run login.py interactively):
+#   login:          python login.py
 #   deploy:         python deploy.py --src <persona-dir> [--name <n>] [--avatar <img>]
 #   resume/update:  python deploy.py --src <persona-dir>                           # agentId auto-read from .talktome.json
 #                     [--update-persona]     also push name/soul/greeting changes to the existing agent
@@ -47,6 +47,7 @@ import base64 as b64
 import hashlib
 import json
 import mimetypes
+import os
 import re
 import sys
 import urllib.error
@@ -61,7 +62,7 @@ AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"
 AVATAR_MAX_BYTES = 5 * 1024 * 1024  # server limit; check locally so an oversized file fails before the upload
 
 # Session storage: <skill-dir>/.env (gitignored). Written after the SMS login, then reused by every run —
-# --token is only needed to override. Keys: TALKTOME_ACCESS_TOKEN / TALKTOME_REFRESH_TOKEN.
+# Legacy --token/--save-token are kept for compatibility; do not use credentials in command arguments. Keys: TALKTOME_ACCESS_TOKEN / TALKTOME_REFRESH_TOKEN.
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 
 
@@ -78,7 +79,10 @@ def read_env() -> dict:
 
 def write_env(patch: dict) -> None:
     env = {**read_env(), **patch}
-    ENV_PATH.write_text("".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
+    fd = os.open(ENV_PATH, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as stream:
+        stream.write("".join(f"{k}={v}\n" for k, v in env.items()))
+    ENV_PATH.chmod(0o600)
 
 
 def main() -> None:
@@ -96,6 +100,8 @@ def main() -> None:
                     help="with --agent-id: also push name/soul/greeting from --src to the existing agent")
     ap.add_argument("--set-handle", help="check + set the homepage slug (talkto.bio/{handle}); SET ONCE, locked after")
     ap.add_argument("--publish", action="store_true", help="publish the agent (outward-facing; confirm with the owner first)")
+    ap.add_argument("--card", metavar="PNG_PATH", help="save the published agent mini-program QR card as PNG")
+    ap.add_argument("--card-env", choices=["release", "trial", "develop"], default="release")
     ap.add_argument("--list", action="store_true", help="list this account's agents (name / agentId / handle / status)")
     ap.add_argument("--show", action="store_true",
                     help="print the agent's current server-side config: profile + soul + greeting + knowledge/skill inventory")
@@ -113,7 +119,7 @@ def main() -> None:
     env = read_env()
     token = args.token or env.get("TALKTOME_ACCESS_TOKEN")
     if not token:
-        sys.exit("no token: run the SMS login then `--save-token <access> <refresh>` (or pass --token)")
+        sys.exit("no token: ask the user to run scripts/login.py interactively")
     auth = {"token": token, "refresh": env.get("TALKTOME_REFRESH_TOKEN")}
 
     def try_refresh() -> bool:
@@ -200,6 +206,21 @@ def main() -> None:
             print(f"{a['agent_name']}\t{a['id']}\thandle={a.get('handle') or '-'}\tstatus={a.get('status')}")
         if not agents:
             print("(no agents under this account)")
+        return
+
+    if args.card:
+        agent_id = resolve_agent_id(required=True)
+        result = post_json("/api/agents/miniprogram-card", {"agentId": agent_id, "envVersion": args.card_env})
+        try:
+            data = b64.b64decode(result["imageBase64"], validate=True)
+            if result.get("contentType") != "image/png" or not data.startswith(b"\x89PNG\r\n\x1a\n"):
+                raise ValueError("expected a PNG card")
+        except (KeyError, ValueError) as error:
+            sys.exit(f"invalid card response: {error}")
+        target = Path(args.card).expanduser().resolve()
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        print(f"mini-program card saved: {target}")
         return
 
     if args.show:
@@ -340,6 +361,15 @@ def main() -> None:
 
     # avatar: optional; each upload writes a NEW object key, so skip when the file's md5 matches the
     # last one we sent (recorded in .talktome.json) — keeps re-runs from piling up dead objects on OSS
+    card_path = src / "card.json"
+    if card_path.is_file():
+        card = json.loads(card_path.read_text(encoding="utf-8"))
+        if not isinstance(card, dict) or set(card) - {"shareIntro", "shareTags", "socials"}:
+            sys.exit("card.json only supports shareIntro, shareTags and socials")
+        if card:
+            post_json("/api/agents/update", {"agentId": agent_id, **card})
+            print("[update] confirmed card copy and contacts pushed")
+
     avatar_path = resolve_avatar()
     if avatar_path:
         content_type = AVATAR_TYPES.get(avatar_path.suffix.lower())

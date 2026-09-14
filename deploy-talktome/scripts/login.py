@@ -48,7 +48,9 @@ def post(path, payload):
             return json.loads(r.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
         body = e.read().decode("utf-8", "replace")
-        print(f"\n[HTTP {e.code}] {body}")
+        print(f"\n[HTTP {e.code}] 登录请求失败，请检查输入或稍后重试。")
+        if e.code == 400 and "source" in body and ("invalid_enum" in body or "Invalid enum" in body):
+            return {"unsupportedSource": True}
         return None
     except Exception as e:
         print(f"\n[网络错误] {type(e).__name__}: {e}")
@@ -70,7 +72,7 @@ def main():
 
     body = {"phone": phone, "cc": "86", "code": code, "source": "skill"}
     res = post("/api/auth/sms/verify", body)
-    if res is None:
+    if res and res.get("unsupportedSource"):
         # 旧版服务端可能不认 source 枚举；验证码未被消耗，去掉字段重发一次
         print("带 source 失败，去掉该字段重试（验证码仍有效）…")
         body.pop("source")
@@ -80,7 +82,7 @@ def main():
 
     at, rt = res.get("accessToken"), res.get("refreshToken")
     if not at or not rt:
-        sys.exit(f"响应里没有 token：{json.dumps(res, ensure_ascii=False)[:300]}")
+        sys.exit("登录响应不完整，未保存会话，请重新登录。")
 
     # 用 deploy.py 的 write_env：合并写，不会抹掉 .env 里其他的键
     write_env({"TALKTOME_ACCESS_TOKEN": at, "TALKTOME_REFRESH_TOKEN": rt})
