@@ -29,7 +29,7 @@ description: 制作并发布 TalkToMe 分身——把用户的知识和资料变
    - **头像**：用户给了图就放成目录下的 `avatar.png`/`.jpg`/`.jpeg`/`.webp`（部署时自动上传），或部署时 `--avatar <路径>` 指定；**不要自己生成或找图**，没有就不放，用户之后可以在 App 里传。
 3. 读取新增本地资料前，询问具体允许读取的目录、文件和记忆来源。读取授权不等于上传授权。首个 Agent 默认是用户对外的 AI 名片，只保留用户确认可公开的事实、项目、能力和联系方式。
 4. **把全部上传内容（人设、开场白、名片文案、头像、知识摘要、技能）给用户过目**，列出排除的私人数据，确认上传及公开范围后继续。不要编造履历或承诺。
-5. 可选 `card.json` 保存用户确认的 `shareIntro`、`shareTags`、`socials`，部署时写入展示资料。具体字段、限制和接口见 [references/api.md](references/api.md)。
+5. 可选 `card.json` 保存用户确认的 `shareIntro`、`shareTags`、`suggestedQuestions`、`socials`，部署时写入展示资料。具体字段、限制和接口见 [references/api.md](references/api.md)。
 
 ## 第二步：登录（拿 accessToken）
 
@@ -116,3 +116,13 @@ python scripts/deploy.py --src <分身目录> --card <输出目录>/talktome-car
 ```
 
 这会调用 `/api/agents/miniprogram-card`，保存真实微信小程序码组成的 PNG 名片；默认正式版，联调可指定 `--card-env develop`。详细契约见 [references/api.md](references/api.md)。通过宿主图片/附件能力把图片直接发给用户，并附主页链接，请用户微信扫码核对。失败须报告并重试同一个 Agent，不能用网页二维码代替，也不能只发 base64 或声称已完成。
+
+### 名片的三个开场问题与分享确认
+
+首个分身面向陌生访客展示用户的名片。与用户一起确认介绍、标签和主页上供访客点选的三个问题；问题应依据用户授权的公开素材，不虚构经历。不要把生成草稿当成已获公开授权。
+
+需要服务端生成时，先按本技能的登录流程取得会话，再以 Bearer 会话调用 `POST /api/agents/card-copy/ensure`，JSON 为 `{"agentId":"<id>"}`。响应为 `state`、`confirmed`、`draft`，后两者均含 `intro`、`tags`、`questions`。若 `state=generating`，每秒调用同参数的 `/api/agents/card-copy/status`，最多等待60秒；失败时允许用户手写，不要伪造生成结果。
+
+把当前草稿（或已确认稿）完整展示给用户，允许修改、取消。介绍最多100字，标签最多3个、每个最多6字，问题必须3个互不重复的非空字符串，每个最多80字。获得明确确认后，以一次 `POST /api/agents/update` 同时提交 `agentId`、`shareIntro`、`shareTags`、`suggestedQuestions`。确认与生成都需拥有该分身。保存失败不能继续发分享卡；保留草稿并重试。未改动且已确认的内容无须重复询问。
+
+也可把已获确认的数据写入 `card.json`，放到部署目录，由部署脚本自动读取上传（`--card` 参数用于输出二维码 PNG 路径，不是上传数据）。这里的 `suggestedQuestions` 与 `shareIntro`、`shareTags` 必须一起提供。最后按本技能的小程序卡片流程请求 `/api/agents/miniprogram-card`，保存返回的 PNG 并在当前 Agent 对话中展示图片给用户。

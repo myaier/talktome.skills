@@ -364,8 +364,8 @@ def main() -> None:
     card_path = src / "card.json"
     if card_path.is_file():
         card = json.loads(card_path.read_text(encoding="utf-8"))
-        if not isinstance(card, dict) or set(card) - {"shareIntro", "shareTags", "socials"}:
-            sys.exit("card.json only supports shareIntro, shareTags and socials")
+        if not isinstance(card, dict) or set(card) - {"shareIntro", "shareTags", "suggestedQuestions", "socials"}:
+            sys.exit("card.json only supports shareIntro, shareTags, suggestedQuestions and socials")
         if card:
             post_json("/api/agents/update", {"agentId": agent_id, **card})
             print("[update] confirmed card copy and contacts pushed")
