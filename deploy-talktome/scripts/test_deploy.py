@@ -191,30 +191,111 @@ class SetCardTests(unittest.TestCase):
 class QrCodeTests(unittest.TestCase):
     PNG = b"\x89PNG\r\n\x1a\n" + b"fake"
 
+    def _response(self, **extra):
+        r = {"imageBase64": base64.b64encode(self.PNG).decode("ascii"), "contentType": "image/png", "scene": "xiaofeng"}
+        r.update(extra)
+        return r
+
     def test_writes_an_image_file_not_base64(self):
         """base64 字符串不是交付物 —— 用户要的是一张能发到群里的图。"""
         with TemporaryDirectory() as tmp:
             src = persona_dir(tmp)
-            response = {
-                "imageBase64": base64.b64encode(self.PNG).decode("ascii"),
-                "contentType": "image/png",
-                "scene": "xiaofeng",
-                "envVersion": "trial",
-            }
+            response = self._response(hasQrCode=True)
             out, calls = run_deploy(["--token", "t", "--src", str(src), "--qrcode"], [response])
 
-            self.assertIn("/api/agents/miniprogram-code", calls[0][0])
-            written = (src / "qrcode.png").read_bytes()
+            self.assertIn("/api/agents/share-card", calls[0][0])
+            written = (src / "share-card.png").read_bytes()
             self.assertEqual(written, self.PNG)
             self.assertNotIn(response["imageBase64"], out, "把 base64 打到了终端上")
+
+    def test_default_deliverable_is_the_card_not_the_bare_code(self):
+        """默认出的是名片图。光一个码发出去，收到的人不知道背后是谁。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            _, calls = run_deploy(["--token", "t", "--src", str(src), "--qrcode"], [self._response()])
+            self.assertIn("/api/agents/share-card", calls[0][0])
+            self.assertEqual(calls[0][1].get("ratio"), "timeline")
+
+    def test_plain_code_asks_for_the_bare_code(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            _, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--qrcode", "--plain-code"],
+                [self._response(envVersion="trial")],
+            )
+            self.assertIn("/api/agents/miniprogram-code", calls[0][0])
+            self.assertTrue((src / "qrcode.png").is_file())
+
+    def test_warns_when_the_card_came_back_without_a_code(self):
+        """没有码的卡是残的 —— 必须说出来，不能让 agent 把它当成品交出去。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            out, _ = run_deploy(["--token", "t", "--src", str(src), "--qrcode"], [self._response(hasQrCode=False)])
+            self.assertIn("WARNING", out)
 
     def test_honours_an_explicit_output_path(self):
         with TemporaryDirectory() as tmp:
             src = persona_dir(tmp)
             target = Path(tmp) / "码.png"
-            response = {"imageBase64": base64.b64encode(self.PNG).decode("ascii"), "contentType": "image/png"}
-            run_deploy(["--token", "t", "--src", str(src), "--qrcode", str(target)], [response])
+            run_deploy(["--token", "t", "--src", str(src), "--qrcode", str(target)], [self._response()])
             self.assertEqual(target.read_bytes(), self.PNG)
+
+
+class SocialsTests(unittest.TestCase):
+    """socials 是可选的，而且服务端是整表替换 —— 漏发等于清空，这几条盯的就是这个。"""
+
+    def _write_card(self, src, **extra):
+        card = {"intro": "做产品的人", "tags": ["产品"], "questions": ["问题一", "问题二", "问题三"]}
+        card.update(extra)
+        (src / "card.json").write_text(json.dumps(card, ensure_ascii=False), encoding="utf-8")
+
+    def test_absent_key_leaves_links_untouched(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            self._write_card(src)
+            _, calls = run_deploy(["--token", "t", "--src", str(src), "--set-card"], [{"agent": {}}])
+            self.assertNotIn("socials", calls[0][1], "card.json 里没写 socials 却发了，会把已有链接清空")
+
+    def test_sends_links_with_optional_label(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            self._write_card(src, socials=[
+                {"platform": "website", "url": "https://example.com", "label": "我的网站"},
+                {"platform": "github", "url": "https://github.com/me"},
+            ])
+            _, calls = run_deploy(["--token", "t", "--src", str(src), "--set-card"], [{"agent": {}}])
+            self.assertEqual(calls[0][1]["socials"], [
+                {"platform": "website", "url": "https://example.com", "label": "我的网站"},
+                {"platform": "github", "url": "https://github.com/me"},
+            ])
+
+    def test_rejects_a_link_without_a_url(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            self._write_card(src, socials=[{"platform": "weibo"}])
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--set-card"], [{"agent": {}}])
+            self.assertIn("url", str(ctx.exception))
+
+    def test_card_copy_refresh_keeps_the_owners_links(self):
+        """重新拉一次文案不该把用户自己填的链接冲掉 —— card.json 是同一个文件。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            self._write_card(src, socials=[{"platform": "website", "url": "https://example.com"}])
+            run_deploy(["--token", "t", "--src", str(src), "--card-copy"],
+                       [{"state": "ready", "draft": {"intro": "新写的介绍", "tags": ["新"], "questions": ["一", "二", "三"]},
+                         "confirmed": {}}])
+            after = json.loads((src / "card.json").read_text(encoding="utf-8"))
+            self.assertEqual(after["intro"], "新写的介绍")
+            self.assertEqual(after["socials"], [{"platform": "website", "url": "https://example.com"}])
+
+    def test_rejects_socials_that_is_not_a_list(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            self._write_card(src, socials={"website": "https://example.com"})
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--set-card"], [{"agent": {}}])
+            self.assertIn("socials", str(ctx.exception))
 
 
 if __name__ == "__main__":

@@ -24,7 +24,10 @@
 #   card copy:      python deploy.py --src <dir> --card-copy                       # generate/poll the AI draft -> writes <dir>/card.json
 #                   (edit card.json WITH the owner, then:)
 #                   python deploy.py --src <dir> --set-card                        # save intro + tags + the three questions
-#   qr code:        python deploy.py --src <dir> --qrcode [out.png]                # mini-program code (published agents only)
+#   share card:     python deploy.py --src <dir> --qrcode [out.png]                # THE deliverable: the card image
+#                     the same card the app shares (avatar + blurb + tags) with the mini-program code
+#                     in the corner. Published agents only. Bare code without the card: --plain-code
+#   socials:        put "socials" in card.json (see --set-card) — website / weibo / xhs / github links
 #   list agents:    python deploy.py --list                                        # name / agentId / handle / status
 #   show config:    python deploy.py --src <dir> --show                            # profile + soul + greeting + file inventory
 # Expired access tokens refresh automatically (rotating refresh token, persisted back to .env).
@@ -55,8 +58,15 @@
 #                                        the three must be sent TOGETHER — the server takes the whole card
 #                                        or nothing (a questions-only write would stamp an intro nobody read
 #                                        as confirmed)
-#   /api/agents/miniprogram-code {agentId}          -> {imageBase64, contentType, scene, envVersion}
+#   /api/agents/update   ... also takes {socials: [{platform, url, label?}]} — up to 50; platform<=50,
+#                                        url<=500, label<=100 chars. Replaces the whole list, so send
+#                                        every link you want kept, not just the new one.
+#   /api/agents/share-card {agentId, ratio?}        -> {imageBase64, contentType, scene, hasQrCode}
+#                                                   the shareable card PNG, rendered server-side;
+#                                                   ratio "timeline" (1:1, default) | "friend" (5:4)
 #                                                   published agents only
+#   /api/agents/miniprogram-code {agentId}          -> {imageBase64, contentType, scene, envVersion}
+#                                                   the bare code, no card. published agents only
 import argparse
 import base64 as b64
 import hashlib
@@ -79,6 +89,7 @@ AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png"
 CARD_INTRO_MAX, CARD_TAGS_MAX, CARD_TAG_LEN_MAX = 100, 3, 6
 CARD_QUESTIONS, CARD_QUESTION_MAX = 3, 30
 CARD_COPY_POLL_SECONDS, CARD_COPY_TIMEOUT_SECONDS = 2, 90
+SOCIALS_MAX, SOCIAL_PLATFORM_MAX, SOCIAL_URL_MAX, SOCIAL_LABEL_MAX = 50, 50, 500, 100
 AVATAR_MAX_BYTES = 5 * 1024 * 1024  # server limit; check locally so an oversized file fails before the upload
 
 # Session storage: <skill-dir>/.env (gitignored). Written after the SMS login, then reused by every run —
@@ -100,6 +111,41 @@ def read_env() -> dict:
 def write_env(patch: dict) -> None:
     env = {**read_env(), **patch}
     ENV_PATH.write_text("".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
+
+
+def parse_socials(card: dict) -> "list[dict] | None":
+    """card.json's optional "socials" -> the API's [{platform, url, label?}].
+
+    Returns None when the key is absent, which the caller uses to mean "do not touch the links".
+    Limits mirror the server's so a bad entry fails here, where the message can name the field.
+    """
+    raw = card.get("socials")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        sys.exit('card.json "socials" must be a list of {"platform": ..., "url": ...}')
+    if len(raw) > SOCIALS_MAX:
+        sys.exit(f"at most {SOCIALS_MAX} social links (got {len(raw)})")
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            sys.exit(f'card.json "socials" entries must be objects: {entry!r}')
+        platform = str(entry.get("platform") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        label = str(entry.get("label") or "").strip()
+        if not platform or not url:
+            sys.exit(f'each social link needs a non-empty "platform" and "url": {entry!r}')
+        if len(platform) > SOCIAL_PLATFORM_MAX:
+            sys.exit(f"platform must be <= {SOCIAL_PLATFORM_MAX} chars: {platform}")
+        if len(url) > SOCIAL_URL_MAX:
+            sys.exit(f"url must be <= {SOCIAL_URL_MAX} chars: {url[:60]}...")
+        if len(label) > SOCIAL_LABEL_MAX:
+            sys.exit(f"label must be <= {SOCIAL_LABEL_MAX} chars: {label}")
+        item = {"platform": platform, "url": url}
+        if label:
+            item["label"] = label
+        out.append(item)
+    return out
 
 
 def main() -> None:
@@ -126,7 +172,12 @@ def main() -> None:
     ap.add_argument("--set-card", action="store_true",
                     help="save <src>/card.json (intro + tags + the three questions) as the confirmed card")
     ap.add_argument("--qrcode", nargs="?", const="", metavar="OUT.PNG",
-                    help="write the agent's mini-program code to a PNG (default <src>/qrcode.png); published agents only")
+                    help="write the shareable card image (blurb + tags + mini-program code) to a PNG "
+                         "(default <src>/share-card.png); published agents only")
+    ap.add_argument("--card-ratio", choices=["timeline", "friend"], default="timeline",
+                    help="share card shape: timeline = 1:1 (default), friend = 5:4")
+    ap.add_argument("--plain-code", action="store_true",
+                    help="with --qrcode: write the bare mini-program code instead of the whole card")
     ap.add_argument("--replace-skills", action="store_true", help="delete each skill before uploading")
     ap.add_argument("--replace-knowledge", action="store_true", help="delete existing knowledge files before uploading")
     args = ap.parse_args()
@@ -310,11 +361,22 @@ def main() -> None:
         if not card.get("intro"):
             sys.exit(f"no card copy yet (state={status.get('state')}) — retry, or write card.json by hand")
         out = card_path()
-        out.write_text(json.dumps({
+        # Re-running this overwrites card.json, so carry over the parts the AI does not write.
+        # socials is the owner's own list of links — losing it because they asked for a fresh
+        # blurb would be a nasty surprise.
+        payload = {
             "intro": card.get("intro", ""),
             "tags": card.get("tags") or [],
             "questions": card.get("questions") or [],
-        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        }
+        if out.is_file():
+            try:
+                previous = json.loads(out.read_text(encoding="utf-8"))
+            except ValueError:
+                previous = {}
+            if isinstance(previous, dict) and previous.get("socials") is not None:
+                payload["socials"] = previous["socials"]
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"card draft written: {out}")
         print("  intro:     " + card.get("intro", ""))
         print("  tags:      " + (" / ".join(card.get("tags") or []) or "-"))
@@ -348,23 +410,42 @@ def main() -> None:
         if too_long:
             # They sit one per line on the card and are tapped, not read — length is a layout constraint
             sys.exit(f"each question must be <= {CARD_QUESTION_MAX} chars: {too_long}")
-        post_json("/api/agents/update", {
+        payload = {
             "agentId": agent_id, "shareIntro": intro, "shareTags": tags, "suggestedQuestions": questions,
-        })
+        }
+        socials = parse_socials(card)
+        # Only sent when the key is present: the server REPLACES the whole list, so treating a missing
+        # key as an empty list would silently wipe links the owner set elsewhere (app, web).
+        if socials is not None:
+            payload["socials"] = socials
+        post_json("/api/agents/update", payload)
         print(f"card confirmed: {intro}")
         print("  tags:      " + (" / ".join(tags) or "-"))
         for i, q in enumerate(questions, 1):
             print(f"  question{i}: {q}")
+        if socials is not None:
+            print("  socials:   " + (" / ".join(f"{x['platform']}={x['url']}" for x in socials) or "(cleared)"))
         return
 
     if args.qrcode is not None:
         agent_id = resolve_agent_id(required=True)
-        result = post_json("/api/agents/miniprogram-code", {"agentId": agent_id})
-        out = Path(args.qrcode) if args.qrcode else (Path(args.src) / "qrcode.png" if args.src else Path("qrcode.png"))
+        # The card, not the bare code. A naked QR tells nobody who is behind it; the card carries the
+        # name, the blurb and the tags, so it works as a message on its own. Run --set-card first —
+        # the card is rendered from the CONFIRMED copy, so an unconfirmed agent gets a thin one.
+        if args.plain_code:
+            result = post_json("/api/agents/miniprogram-code", {"agentId": agent_id})
+            default_name = "qrcode.png"
+            what = "mini-program code"
+        else:
+            result = post_json("/api/agents/share-card", {"agentId": agent_id, "ratio": args.card_ratio})
+            default_name = "share-card.png"
+            what = "share card"
+        out = Path(args.qrcode) if args.qrcode else (Path(args.src) / default_name if args.src else Path(default_name))
         # The base64 string is NOT the deliverable — what the owner needs is an image they can send
         out.write_bytes(b64.b64decode(result["imageBase64"]))
-        print(f"mini-program code written: {out.resolve()}  ({result.get('contentType')}, "
-              f"scene={result.get('scene')}, env={result.get('envVersion')})")
+        print(f"{what} written: {out.resolve()}  ({result.get('contentType')}, scene={result.get('scene')})")
+        if result.get("hasQrCode") is False:
+            print("WARNING: the code could not be fetched, so this card has no QR corner — re-run to retry.")
         print("Show this image to the owner directly, together with the card link.")
         return
 
