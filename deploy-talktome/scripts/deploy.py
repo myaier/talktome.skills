@@ -21,6 +21,10 @@
 #                     (also sets the agent's email address to <slug>@talkto.bio — same slug, confirmed together;
 #                      re-run with the SAME slug to repair older agents that got a handle but no email)
 #   publish:        python deploy.py --src <dir> --publish                         # outward-facing: confirm with the owner first
+#   card copy:      python deploy.py --src <dir> --card-copy                       # generate/poll the AI draft -> writes <dir>/card.json
+#                   (edit card.json WITH the owner, then:)
+#                   python deploy.py --src <dir> --set-card                        # save intro + tags + the three questions
+#   qr code:        python deploy.py --src <dir> --qrcode [out.png]                # mini-program code (published agents only)
 #   list agents:    python deploy.py --list                                        # name / agentId / handle / status
 #   show config:    python deploy.py --src <dir> --show                            # profile + soul + greeting + file inventory
 # Expired access tokens refresh automatically (rotating refresh token, persisted back to .env).
@@ -42,6 +46,17 @@
 #   /api/agent-skills/delete {agentId, skillName}   deletes the whole skill — used by --replace-skills, because
 #                                                   the platform sync is additive (renamed/removed files would linger)
 #   /api/knowledge-docs/list, /api/agent-skills/list  {agentId}  -> verification
+#   /api/agents/card-copy/ensure, /api/agents/card-copy/status  {agentId}
+#                                                   -> {state, confirmed:{intro,tags,questions}, draft:{...}}
+#                                                   state=generating means a job is ALREADY running: poll
+#                                                   /status, do not submit again
+#   /api/agents/update   ... also takes {shareIntro<=100, shareTags<=3 x<=6 chars,
+#                                        suggestedQuestions: exactly 3, distinct, each <=30 chars}
+#                                        the three must be sent TOGETHER — the server takes the whole card
+#                                        or nothing (a questions-only write would stamp an intro nobody read
+#                                        as confirmed)
+#   /api/agents/miniprogram-code {agentId}          -> {imageBase64, contentType, scene, envVersion}
+#                                                   published agents only
 import argparse
 import base64 as b64
 import hashlib
@@ -49,6 +64,7 @@ import json
 import mimetypes
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +74,11 @@ DEFAULT_BASE = "https://prod-backend.talkto.bio"
 SKIP_SKILL_DIRS = {"scripts"}  # skill script files are not used in online chat; skip to keep the sync light
 # Avatar formats the backend accepts (POST /api/agents/avatar); keys double as the auto-detect extensions
 AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+# Card limits, mirrored from the backend so a bad card.json fails here with a readable message
+# instead of coming back as a 400 the agent then has to decode.
+CARD_INTRO_MAX, CARD_TAGS_MAX, CARD_TAG_LEN_MAX = 100, 3, 6
+CARD_QUESTIONS, CARD_QUESTION_MAX = 3, 30
+CARD_COPY_POLL_SECONDS, CARD_COPY_TIMEOUT_SECONDS = 2, 90
 AVATAR_MAX_BYTES = 5 * 1024 * 1024  # server limit; check locally so an oversized file fails before the upload
 
 # Session storage: <skill-dir>/.env (gitignored). Written after the SMS login, then reused by every run —
@@ -99,6 +120,13 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="list this account's agents (name / agentId / handle / status)")
     ap.add_argument("--show", action="store_true",
                     help="print the agent's current server-side config: profile + soul + greeting + knowledge/skill inventory")
+    ap.add_argument("--card-copy", action="store_true",
+                    help="generate (or fetch) the AI draft of the card blurb, tags and three questions; "
+                         "writes <src>/card.json for the owner to edit")
+    ap.add_argument("--set-card", action="store_true",
+                    help="save <src>/card.json (intro + tags + the three questions) as the confirmed card")
+    ap.add_argument("--qrcode", nargs="?", const="", metavar="OUT.PNG",
+                    help="write the agent's mini-program code to a PNG (default <src>/qrcode.png); published agents only")
     ap.add_argument("--replace-skills", action="store_true", help="delete each skill before uploading")
     ap.add_argument("--replace-knowledge", action="store_true", help="delete existing knowledge files before uploading")
     args = ap.parse_args()
@@ -254,6 +282,90 @@ def main() -> None:
         write_manifest({"agentId": agent_id, "handle": args.set_handle})
         print(f"handle set: talkto.bio/{args.set_handle}  (locked — it can never be changed)")
         print(f"email set:  {args.set_handle}@talkto.bio")
+        return
+
+    # ---- card copy: the blurb, the tags and the three questions the visitor sees ----
+    # Three separate columns server-side, and the AI only ever writes the *draft* ones. What goes
+    # public is whatever the owner confirms here — so this is two commands on purpose: --card-copy
+    # fetches the draft, the owner edits card.json, --set-card writes it.
+    def card_path() -> Path:
+        if not args.src:
+            sys.exit("--src required: card.json lives in the persona dir")
+        return Path(args.src) / "card.json"
+
+    if args.card_copy:
+        agent_id = resolve_agent_id(required=True)
+        status = post_json("/api/agents/card-copy/ensure", {"agentId": agent_id})
+        waited = 0
+        # state=generating means a job is already running (possibly started by saving the agent).
+        # Poll /status rather than submitting again — a second submit is a second LLM call.
+        while status.get("state") == "generating" and waited < CARD_COPY_TIMEOUT_SECONDS:
+            time.sleep(CARD_COPY_POLL_SECONDS)
+            waited += CARD_COPY_POLL_SECONDS
+            status = post_json("/api/agents/card-copy/status", {"agentId": agent_id})
+        draft, confirmed = status.get("draft") or {}, status.get("confirmed") or {}
+        # Draft first: it was written against the CURRENT material, so after the owner edits the
+        # persona this is the version that reflects it. Fall back to what is already public.
+        card = draft if draft.get("intro") else confirmed
+        if not card.get("intro"):
+            sys.exit(f"no card copy yet (state={status.get('state')}) — retry, or write card.json by hand")
+        out = card_path()
+        out.write_text(json.dumps({
+            "intro": card.get("intro", ""),
+            "tags": card.get("tags") or [],
+            "questions": card.get("questions") or [],
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"card draft written: {out}")
+        print("  intro:     " + card.get("intro", ""))
+        print("  tags:      " + (" / ".join(card.get("tags") or []) or "-"))
+        for i, q in enumerate(card.get("questions") or [], 1):
+            print(f"  question{i}: {q}")
+        print()
+        print("GO THROUGH IT WITH THE OWNER, edit card.json, then: --set-card")
+        return
+
+    if args.set_card:
+        agent_id = resolve_agent_id(required=True)
+        path = card_path()
+        if not path.is_file():
+            sys.exit(f"card.json not found: {path} — run --card-copy first, or write it by hand")
+        try:
+            card = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            sys.exit(f"card.json is not valid JSON: {exc}")
+        intro = str(card.get("intro") or "").strip()
+        tags = [str(t).strip() for t in (card.get("tags") or []) if str(t).strip()]
+        questions = [str(q).strip() for q in (card.get("questions") or []) if str(q).strip()]
+        # Checked here so the failure names the field. The server enforces the same limits.
+        if not intro or len(intro) > CARD_INTRO_MAX:
+            sys.exit(f"intro must be 1-{CARD_INTRO_MAX} chars (got {len(intro)})")
+        if len(tags) > CARD_TAGS_MAX or any(len(t) > CARD_TAG_LEN_MAX for t in tags):
+            sys.exit(f"at most {CARD_TAGS_MAX} tags, each <= {CARD_TAG_LEN_MAX} chars: {tags}")
+        if len(questions) != CARD_QUESTIONS or len(set(questions)) != CARD_QUESTIONS:
+            sys.exit(f"exactly {CARD_QUESTIONS} distinct questions required (got {len(questions)}, "
+                     f"{len(set(questions))} distinct)")
+        too_long = [q for q in questions if len(q) > CARD_QUESTION_MAX]
+        if too_long:
+            # They sit one per line on the card and are tapped, not read — length is a layout constraint
+            sys.exit(f"each question must be <= {CARD_QUESTION_MAX} chars: {too_long}")
+        post_json("/api/agents/update", {
+            "agentId": agent_id, "shareIntro": intro, "shareTags": tags, "suggestedQuestions": questions,
+        })
+        print(f"card confirmed: {intro}")
+        print("  tags:      " + (" / ".join(tags) or "-"))
+        for i, q in enumerate(questions, 1):
+            print(f"  question{i}: {q}")
+        return
+
+    if args.qrcode is not None:
+        agent_id = resolve_agent_id(required=True)
+        result = post_json("/api/agents/miniprogram-code", {"agentId": agent_id})
+        out = Path(args.qrcode) if args.qrcode else (Path(args.src) / "qrcode.png" if args.src else Path("qrcode.png"))
+        # The base64 string is NOT the deliverable — what the owner needs is an image they can send
+        out.write_bytes(b64.b64decode(result["imageBase64"]))
+        print(f"mini-program code written: {out.resolve()}  ({result.get('contentType')}, "
+              f"scene={result.get('scene')}, env={result.get('envVersion')})")
+        print("Show this image to the owner directly, together with the card link.")
         return
 
     if args.publish:
