@@ -110,6 +110,16 @@ python scripts/deploy.py --src <目录> --prune-knowledge           # 按本地�
 - 本地没有 `knowledge/` 目录时 prune 会**直接拒绝**——那多半是跑错了目录，照做就是把线上清空。
 - 移动用 `--mv-knowledge`，别「删了再传一遍」：服务端会把图片的 OCR 副本一起搬走，删了重传则会丢。
 
+技能同理（xchat 把技能同步进工作区之后，本地删掉的文件不会从那份副本里消失）：
+
+```bash
+python scripts/deploy.py --src <目录> --rm-skill <技能名>          # 整个技能删掉
+python scripts/deploy.py --src <目录> --rm-skill <技能名> <文件>   # 只删技能里的一个文件
+```
+
+技能名或文件名对不上时命令会当场报错并列出线上有哪些，不会发一个删不到东西的请求。
+删 `SKILL.md` 会告警：那是技能的入口，没有它 xchat 不再加载这个技能，剩下的文件只是死数据。
+
 ## 第四步：handle 与发布（两步都必须用户确认）
 
 1. **请用户起主页名 handle**（即 `talkto.bio/{handle}`），然后校验并设置：

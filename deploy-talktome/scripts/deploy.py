@@ -22,6 +22,7 @@
 #                   python deploy.py --src <dir> --rm-knowledge <path>          # one file, or a whole folder
 #                   python deploy.py --src <dir> --mv-knowledge <src> <dest>    # move / rename, file or folder
 #                   python deploy.py --src <dir> --prune-knowledge              # delete whatever is no longer local
+#   skills:         python deploy.py --src <dir> --rm-skill <name> [path]       # whole skill, or one file in it
 #                   prefer --prune-knowledge over --replace-knowledge: it only touches what is actually
 #                   gone, instead of deleting and re-uploading everything (slow, and half-done on failure)
 #   set handle:     python deploy.py --src <dir> --set-handle <slug>               # checked first; SET ONCE, locked after
@@ -57,8 +58,9 @@
 #   /api/agents/cover {agentId, base64, contentType}    card-page cover image, same limits as /avatar
 #   /api/agent-skills/upload?agentId=&skillName=&path=   raw file bytes; path may contain subdirs
 #       limits: 2MB/file, 100 files and 20MB total per agent; skillName matches ^[a-z0-9][a-z0-9_-]{0,63}$
-#   /api/agent-skills/delete {agentId, skillName}   deletes the whole skill — used by --replace-skills, because
-#                                                   the platform sync is additive (renamed/removed files would linger)
+#   /api/agent-skills/delete {agentId, skillName, path?}   path given → that one file; omitted → the whole
+#                                                   skill. Used by --rm-skill and --replace-skills, because the
+#                                                   platform sync is additive (renamed/removed files would linger)
 #   /api/knowledge-docs/list, /api/agent-skills/list  {agentId}  -> verification
 #   /api/agents/card-copy/ensure, /api/agents/card-copy/status  {agentId}
 #                                                   -> {state, confirmed:{intro,tags,questions}, draft:{...}}
@@ -199,6 +201,8 @@ def main() -> None:
     ap.add_argument("--prune-knowledge", action="store_true",
                     help="delete remote knowledge that is no longer in the local knowledge/ dir "
                          "(upload is additive, so deleting a file locally does NOT remove it online)")
+    ap.add_argument("--rm-skill", nargs="+", metavar=("SKILL", "PATH"),
+                    help="delete a whole skill, or just one file inside it: --rm-skill <name> [path]")
     ap.add_argument("--replace-skills", action="store_true", help="delete each skill before uploading")
     ap.add_argument("--replace-knowledge", action="store_true", help="delete existing knowledge files before uploading")
     args = ap.parse_args()
@@ -454,6 +458,37 @@ def main() -> None:
         if not args.src:
             sys.exit("--prune-knowledge 需要 --src：要跟哪个目录对齐")
         prune_knowledge(resolve_agent_id(required=True), Path(args.src) / "knowledge")
+        return
+
+    # ---- skills housekeeping ----
+    # 技能的同步和知识库一样是**只增不减**的：xchat 把技能同步进工作区之后，本地删掉的文件
+    # 不会从那份副本里消失。所以删一个技能文件也要显式来。
+    def rm_skill(agent_id: str, skill_name: str, path: str | None) -> None:
+        skills = {s["skillName"]: s for s in post_json("/api/agent-skills/list", {"agentId": agent_id})["skills"]}
+        if skill_name not in skills:
+            sys.exit(f"no such skill online: {skill_name} "
+                     f"(have: {', '.join(sorted(skills)) or '(none)'}; full list: --show)")
+        if path is None:
+            r = post_json("/api/agent-skills/delete", {"agentId": agent_id, "skillName": skill_name})
+            print(f"[skill] deleted {skill_name}: {r.get('deleted', 0)} files")
+            return
+        known = {f["path"] for f in skills[skill_name]["files"]}
+        if path not in known:
+            sys.exit(f"no such file in {skill_name}: {path} "
+                     f"(have: {', '.join(sorted(known)[:8]) or '(none)'})")
+        # SKILL.md 是这个技能的入口：没有它 xchat 不会把目录注册成技能，只当一堆死数据。
+        # 允许删，但要说清楚 —— 删完还剩别的文件时，用户多半不是想让技能失效。
+        if path == "SKILL.md" and len(known) > 1:
+            print(f"[skill] WARNING: {skill_name}/SKILL.md 是入口文件，删掉之后这个技能不再被加载，"
+                  f"剩下的 {len(known) - 1} 个文件只是死数据")
+        post_json("/api/agent-skills/delete", {"agentId": agent_id, "skillName": skill_name, "path": path})
+        print(f"[skill] deleted {skill_name}/{path}")
+
+    if args.rm_skill:
+        if len(args.rm_skill) > 2:
+            sys.exit("--rm-skill 最多两个参数：技能名，以及可选的技能内文件路径")
+        rm_skill(resolve_agent_id(required=True), args.rm_skill[0],
+                 args.rm_skill[1] if len(args.rm_skill) > 1 else None)
         return
 
     # ---- card copy: the blurb, the tags and the three questions the visitor sees ----

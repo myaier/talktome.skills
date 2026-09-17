@@ -451,5 +451,69 @@ class CoverTests(unittest.TestCase):
             self.assertIn("unsupported cover type", str(ctx.exception))
 
 
+class SkillHousekeepingTests(unittest.TestCase):
+    """删技能 / 删技能里的一个文件。
+
+    技能的同步和知识库一样只增不减，所以本地删掉一个文件不等于线上删掉。
+    这里守的是「别删错东西」：技能名或文件名对不上时要当场报错，而不是发一个删不到东西的请求。
+    """
+
+    SKILLS = {"skills": [
+        {"skillName": "pricing", "totalBytes": 30, "hasSkillMd": True,
+         "files": [{"path": "SKILL.md", "size": 10, "etag": "a"},
+                   {"path": "refs/table.md", "size": 20, "etag": "b"}]},
+        {"skillName": "faq", "totalBytes": 5, "hasSkillMd": True,
+         "files": [{"path": "SKILL.md", "size": 5, "etag": "c"}]},
+    ]}
+
+    def test_deletes_the_whole_skill_when_no_path_is_given(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            out, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--rm-skill", "pricing"],
+                [self.SKILLS, {"ok": True, "deleted": 2}],
+            )
+            self.assertIn("agent-skills/delete", calls[-1][0])
+            self.assertEqual(calls[-1][1]["skillName"], "pricing")
+            self.assertNotIn("path", calls[-1][1], "不给 path 才是整个技能删掉")
+            self.assertIn("2 files", out)
+
+    def test_deletes_one_file_inside_a_skill(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            _, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--rm-skill", "pricing", "refs/table.md"],
+                [self.SKILLS, {"ok": True, "deleted": 1}],
+            )
+            self.assertEqual(calls[-1][1]["path"], "refs/table.md")
+            self.assertEqual(calls[-1][1]["skillName"], "pricing")
+
+    def test_warns_when_removing_the_entry_file(self):
+        """没有 SKILL.md，xchat 就不再把这个目录注册成技能 —— 剩下的文件全变死数据。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            out, _ = run_deploy(
+                ["--token", "t", "--src", str(src), "--rm-skill", "pricing", "SKILL.md"],
+                [self.SKILLS, {"ok": True, "deleted": 1}],
+            )
+            self.assertIn("WARNING", out)
+            self.assertIn("不再被加载", out)
+
+    def test_refuses_an_unknown_skill(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--rm-skill", "nope"], [self.SKILLS])
+            self.assertIn("no such skill online", str(ctx.exception))
+
+    def test_refuses_an_unknown_file(self):
+        """路径打错时当场说，别发一个删不到东西的请求然后报告成功。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--rm-skill", "pricing", "nope.md"], [self.SKILLS])
+            self.assertIn("no such file in pricing", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
