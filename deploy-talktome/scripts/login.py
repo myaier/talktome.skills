@@ -13,6 +13,7 @@ refreshToken 当命令行参数传给 `deploy.py --save-token`，两个长期凭
 
 注意：同一手机号两次发送验证码至少间隔 60 秒。
 """
+import argparse
 import json
 import os
 import sys
@@ -26,6 +27,8 @@ from deploy import DEFAULT_BASE, ENV_PATH, write_env  # noqa: E402
 
 sys.stdout.reconfigure(encoding="utf-8")
 
+# 登哪个环境。测试环境和 prod 的账号体系是分开的 —— 拿 prod 的 token 去打 int
+# 只会收到一个看不出原因的 401，所以这里必须能改。
 BASE = DEFAULT_BASE
 
 
@@ -57,6 +60,13 @@ def post(path, payload):
 
 
 def main():
+    global BASE
+    ap = argparse.ArgumentParser(description="TalkToMe 手机号登录：把会话写进技能目录的 .env")
+    ap.add_argument("--base", default=DEFAULT_BASE,
+                    help=f"后端地址（默认 {DEFAULT_BASE}；测试环境用 https://int-backend.talkto.bio）")
+    BASE = ap.parse_args().base.rstrip("/")
+    print(f"登录到：{BASE}")
+
     phone = input("手机号（+86，只输 11 位数字）: ").strip()
     if not (phone.isdigit() and len(phone) == 11):
         sys.exit("手机号格式不对")
@@ -82,9 +92,10 @@ def main():
     if not at or not rt:
         sys.exit(f"响应里没有 token：{json.dumps(res, ensure_ascii=False)[:300]}")
 
-    # 用 deploy.py 的 write_env：合并写，不会抹掉 .env 里其他的键
-    write_env({"TALKTOME_ACCESS_TOKEN": at, "TALKTOME_REFRESH_TOKEN": rt})
-    print(f"\n登录成功，会话已写入 {ENV_PATH}")
+    # 用 deploy.py 的 write_env：合并写，不会抹掉 .env 里其他的键。base 也记下来 ——
+    # deploy.py 默认读它，后面每条命令都不用再写 --base，也就不会有"某一条忘了带、悄悄打到 prod"。
+    write_env({"TALKTOME_ACCESS_TOKEN": at, "TALKTOME_REFRESH_TOKEN": rt, "TALKTOME_API_BASE": BASE})
+    print(f"\n登录成功，会话已写入 {ENV_PATH}（base={BASE}）")
     if res.get("isNewUser"):
         print("（这个手机号是新注册的）")
 

@@ -515,5 +515,61 @@ class SkillHousekeepingTests(unittest.TestCase):
             self.assertIn("no such file in pricing", str(ctx.exception))
 
 
+class BaseResolutionTests(unittest.TestCase):
+    """打哪个环境。
+
+    这里最容易犯的错是"某一条命令忘了带 --base，于是悄悄打到 prod 上"。token 是对不上的，
+    但服务端只回一个 401，从外面完全看不出是环境错了还是 token 过期了。
+    所以 base 记在 .env 里（登录时定一次），而且手写的 --base 跟它冲突时要当场拦住。
+    """
+
+    def _env(self, tmp, **kv):
+        """把技能的 .env 指到临时目录，别动真的那份。"""
+        path = Path(tmp) / ".env"
+        path.write_text("".join(f"{k}={v}\n" for k, v in kv.items()), encoding="utf-8")
+        return mock.patch.object(deploy, "ENV_PATH", path)
+
+    def test_uses_the_base_recorded_at_login(self):
+        with TemporaryDirectory() as tmp, self._env(tmp, TALKTOME_ACCESS_TOKEN="t",
+                                                    TALKTOME_API_BASE="https://int-backend.talkto.bio"):
+            _, calls = run_deploy(["--list"], [{"agents": []}])
+            self.assertTrue(calls[0][0].startswith("https://int-backend.talkto.bio"),
+                            f"没用登录时那个 base：{calls[0][0]}")
+
+    def test_falls_back_to_prod_when_nothing_was_recorded(self):
+        with TemporaryDirectory() as tmp, self._env(tmp, TALKTOME_ACCESS_TOKEN="t"):
+            _, calls = run_deploy(["--list"], [{"agents": []}])
+            self.assertTrue(calls[0][0].startswith(deploy.DEFAULT_BASE))
+
+    def test_explicit_base_wins_when_it_matches(self):
+        with TemporaryDirectory() as tmp, self._env(tmp, TALKTOME_ACCESS_TOKEN="t",
+                                                    TALKTOME_API_BASE="https://int-backend.talkto.bio"):
+            _, calls = run_deploy(["--base", "https://int-backend.talkto.bio/", "--list"], [{"agents": []}])
+            self.assertTrue(calls[0][0].startswith("https://int-backend.talkto.bio/api"), calls[0][0])
+
+    def test_refuses_a_base_that_contradicts_the_session(self):
+        """拿 int 的 token 去打 prod：当场说清楚，别让人对着一个 401 猜半天。"""
+        with TemporaryDirectory() as tmp, self._env(tmp, TALKTOME_ACCESS_TOKEN="t",
+                                                    TALKTOME_API_BASE="https://int-backend.talkto.bio"):
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--base", deploy.DEFAULT_BASE, "--list"], [])
+            self.assertIn("token mismatch", str(ctx.exception))
+
+    def test_save_token_records_the_base_too(self):
+        with TemporaryDirectory() as tmp, self._env(tmp):
+            run_deploy(["--base", "https://int-backend.talkto.bio", "--save-token", "a", "r"], [])
+            saved = (Path(tmp) / ".env").read_text(encoding="utf-8")
+            self.assertIn("TALKTOME_API_BASE=https://int-backend.talkto.bio", saved)
+
+
+class LoginBaseTests(unittest.TestCase):
+    """login.py 必须能登非 prod 环境，否则 int 的 token 根本拿不到。"""
+
+    def test_login_accepts_a_base_and_records_it(self):
+        src = (Path(deploy.__file__).parent / "login.py").read_text(encoding="utf-8")
+        self.assertIn('ap.add_argument("--base"', src, "login.py 要能指定环境")
+        self.assertIn('"TALKTOME_API_BASE": BASE', src, "登录时要把 base 一起写进 .env")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
