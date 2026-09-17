@@ -298,5 +298,158 @@ class SocialsTests(unittest.TestCase):
             self.assertIn("socials", str(ctx.exception))
 
 
+class KnowledgeHousekeepingTests(unittest.TestCase):
+    """知识库的删 / 移 / 对齐。
+
+    这三条之前完全没有，agent 想删掉一个文件只能 --replace-knowledge 把线上全删了重传 ——
+    文件多的时候又慢又险，还会把用户在 App 里整理好的目录一起铲掉。所以这里守的是
+    「只动该动的那个」：删单个文件不碰别的、移动用的是 move 而不是删了重传、prune 不碰没变的。
+    """
+
+    TREE = {
+        "files": [
+            {"filename": "resume.md", "size": 10, "etag": "a"},
+            {"filename": "projects/x.md", "size": 20, "etag": "b"},
+            {"filename": "pics/logo.png", "size": 30, "etag": "c", "isImage": True},
+        ],
+        "folders": ["projects", "pics"],
+    }
+
+    def test_removes_one_file_and_nothing_else(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            _, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--rm-knowledge", "projects/x.md"],
+                [self.TREE, {"ok": True}],
+            )
+            deletes = [c for c in calls if "knowledge-docs/delete" in c[0]]
+            self.assertEqual(len(deletes), 1, "只该删一个")
+            self.assertEqual(deletes[0][1]["filename"], "projects/x.md")
+
+    def test_carries_the_image_flag(self):
+        """图片存在服务端的 image/ 子树下，isImage 传错就删不掉，而且不会报错。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            _, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--rm-knowledge", "pics/logo.png"],
+                [self.TREE, {"ok": True}],
+            )
+            self.assertIs(calls[-1][1]["isImage"], True)
+
+    def test_removing_a_folder_uses_the_folder_endpoint(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            out, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--rm-knowledge", "projects"],
+                [self.TREE, {"ok": True}],
+            )
+            self.assertIn("knowledge-docs/folder/delete", calls[-1][0])
+            self.assertEqual(calls[-1][1]["path"], "projects")
+            self.assertIn("1 files inside", out, "删目录前要说清楚里面有多少东西")
+
+    def test_refuses_to_delete_something_that_is_not_there(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--rm-knowledge", "nope.md"], [self.TREE])
+            self.assertIn("not found online", str(ctx.exception))
+
+    def test_move_uses_the_move_endpoint_not_delete_and_reupload(self):
+        """删了重传会丢掉服务端的 OCR 副本，而且中途失败文件就没了。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            _, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--mv-knowledge", "resume.md", "about/resume.md"],
+                [self.TREE, {"ok": True}],
+            )
+            self.assertIn("knowledge-docs/move", calls[-1][0])
+            self.assertEqual(calls[-1][1]["sourcePath"], "resume.md")
+            self.assertEqual(calls[-1][1]["destinationPath"], "about/resume.md")
+            self.assertEqual(calls[-1][1]["kind"], "file")
+            self.assertFalse(any("delete" in c[0] for c in calls), "移动不该走删除")
+
+    def test_move_refuses_to_overwrite(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(
+                    ["--token", "t", "--src", str(src), "--mv-knowledge", "resume.md", "projects/x.md"],
+                    [self.TREE],
+                )
+            self.assertIn("already exists", str(ctx.exception))
+
+    def test_prune_deletes_only_what_is_gone_locally(self):
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            kdir = src / "knowledge"
+            (kdir / "projects").mkdir(parents=True)
+            (kdir / "resume.md").write_text("x", encoding="utf-8")
+            (kdir / "projects" / "x.md").write_text("y", encoding="utf-8")
+            # 本地没有 pics/logo.png，也没有 pics/ 这个目录 -> 两样都该被清掉
+            out, calls = run_deploy(
+                ["--token", "t", "--src", str(src), "--prune-knowledge"],
+                [self.TREE, {"ok": True}, {"ok": True}],
+            )
+            deleted = [c[1].get("filename") for c in calls if "knowledge-docs/delete" in c[0]]
+            self.assertEqual(deleted, ["pics/logo.png"], "只该删本地已经没有的那一个")
+            folders = [c[1]["path"] for c in calls if "folder/delete" in c[0]]
+            self.assertEqual(folders, ["pics"])
+            self.assertIn("1 file(s), 1 folder(s) removed", out)
+
+    def test_prune_refuses_when_there_is_no_local_knowledge_dir(self):
+        """本地没有 knowledge/ 多半是跑错目录，照做就是把线上清空。"""
+        with TemporaryDirectory() as tmp:
+            src = persona_dir(tmp)
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--prune-knowledge"], [])
+            self.assertIn("refusing to prune", str(ctx.exception))
+
+
+class CoverTests(unittest.TestCase):
+    """封面图：名片页顶部头像后面那一条，和头像共用一套上传逻辑。"""
+
+    PNG = b"\x89PNG\r\n\x1a\n" + b"cover-bytes"
+
+    def _src(self, tmp):
+        src = persona_dir(tmp)
+        (src / "soul.md").write_text("我是谁", encoding="utf-8")
+        return src
+
+    def test_cover_in_the_persona_dir_is_picked_up(self):
+        with TemporaryDirectory() as tmp:
+            src = self._src(tmp)
+            (src / "cover.png").write_bytes(self.PNG)
+            _, calls = run_deploy(
+                ["--token", "t", "--src", str(src)],
+                [{"agent": {}, "url": "https://oss/cover.png"},
+                 {"files": []}, {"skills": []}, {"files": []}, {"skills": []}],
+            )
+            covers = [c for c in calls if c[0].endswith("/api/agents/cover")]
+            self.assertEqual(len(covers), 1, "目录里的 cover.png 要被自动认出来")
+            self.assertEqual(covers[0][1]["contentType"], "image/png")
+            self.assertEqual(base64.b64decode(covers[0][1]["base64"]), self.PNG)
+
+    def test_unchanged_cover_is_not_reuploaded(self):
+        """每次上传都写一个新的对象 key，不跳过的话每跑一次就在 OSS 上多一份死对象。"""
+        with TemporaryDirectory() as tmp:
+            src = self._src(tmp)
+            (src / "cover.png").write_bytes(self.PNG)
+            run_deploy(["--token", "t", "--src", str(src)],
+                       [{"agent": {}, "url": "u"}, {"files": []}, {"skills": []}, {"files": []}, {"skills": []}])
+            out, calls = run_deploy(["--token", "t", "--src", str(src)],
+                                    [{"files": []}, {"skills": []}, {"files": []}, {"skills": []}])
+            self.assertFalse(any(c[0].endswith("/api/agents/cover") for c in calls))
+            self.assertIn("unchanged", out)
+
+    def test_rejects_an_unsupported_format(self):
+        with TemporaryDirectory() as tmp:
+            src = self._src(tmp)
+            bad = Path(tmp) / "cover.gif"
+            bad.write_bytes(b"GIF89a")
+            with self.assertRaises(SystemExit) as ctx:
+                run_deploy(["--token", "t", "--src", str(src), "--cover", str(bad)], [])
+            self.assertIn("unsupported cover type", str(ctx.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

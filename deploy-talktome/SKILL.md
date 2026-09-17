@@ -70,6 +70,8 @@ python scripts/deploy.py --src <分身目录>
 
 头像：目录里有 `avatar.png`/`.jpg`/`.jpeg`/`.webp` 就自动上传，也可以 `--avatar <图片路径>` 指向目录外的图（jpg/png/webp，≤5MB，其他格式服务端会拒）。换头像只要替换这张图再重跑一次部署命令即可；图没变则跳过不重传。
 
+封面图同理：目录里放 `cover.png`（或 `.jpg`/`.jpeg`/`.webp`），或 `--cover <图片路径>`。封面是**名片页顶部头像后面那一条背景**，不是分享出去的那张卡片。限制和头像一样。
+
 脚本会自动完成：创建分身 → 知识库摊平上传（预查重名）→ 技能逐文件上传（校验 SKILL.md frontmatter，warnings 非空要修）→ 拉取清单核对。**增量上传**：重跑时按内容哈希（服务端 etag）跳过未变化的文件，只传新增/有改动的，中断后重跑即续传。接口路径与限额等细节都在脚本头部注释里，排障时读脚本即可。
 
 **agentId 不需要用户知道**：首次部署后脚本把它写进 `<分身目录>/.talktome.json`，之后对同一目录的所有操作自动读取。用户报分身名字时，先看工作目录下各分身目录的 `.talktome.json` 找到对应目录；找不到就 `python scripts/deploy.py --list` 列出账号下全部分身（名字/agentId/handle/状态）按名字匹配，再用 `--agent-id` 显式指定并借此重建 `.talktome.json`。
@@ -88,8 +90,25 @@ python scripts/deploy.py --src <分身目录> --show   # 目录不在手边时�
 # 知识库/技能内容变了（同名覆盖）：
 python scripts/deploy.py --src <目录>
 # 名字/人设/开场白也要更新：加 --update-persona
-# 知识文件有改名/删除：加 --replace-knowledge；技能文件有改名/删除：加 --replace-skills
+# 技能文件有改名/删除：加 --replace-skills
 ```
+
+⚠️ **上传是只增不减的**：本地删掉一个知识文件再重跑，线上那个文件**还在**（分身仍然会读到它）。
+删东西要显式来：
+
+```bash
+python scripts/deploy.py --src <目录> --rm-knowledge <路径>        # 删一个文件，或整个文件夹
+python scripts/deploy.py --src <目录> --mv-knowledge <源> <目标>   # 移动 / 重命名，文件和文件夹都行
+python scripts/deploy.py --src <目录> --prune-knowledge           # 按本地目录对齐：删掉线上多出来的
+```
+
+路径都是**相对 `knowledge/`** 的，跟 `--show` 里列出来的一致。
+
+- **优先用 `--prune-knowledge`，不要用 `--replace-knowledge`。** 后者是全删重传：文件多时又慢又险
+  （中途失败就只剩半个知识库），还会连用户在 App 里整理好的目录一起铲掉。prune 只动本地已经没有的，
+  没变的文件一个不碰。
+- 本地没有 `knowledge/` 目录时 prune 会**直接拒绝**——那多半是跑错了目录，照做就是把线上清空。
+- 移动用 `--mv-knowledge`，别「删了再传一遍」：服务端会把图片的 OCR 副本一起搬走，删了重传则会丢。
 
 ## 第四步：handle 与发布（两步都必须用户确认）
 

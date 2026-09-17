@@ -15,8 +15,15 @@
 #                     [--update-persona]     also push name/soul/greeting changes to the existing agent
 #                     [--replace-skills]     delete each skill first (use when skill files were renamed/removed)
 #                     [--replace-knowledge]  delete existing knowledge files first (same reason)
-#   avatar:         put avatar.png|jpg|jpeg|webp in the persona dir (auto-picked up), or pass --avatar <path>;
-#                   uploaded on every deploy run, skipped when the file's md5 matches the last upload
+#   avatar/cover:   put avatar.png|jpg|jpeg|webp (and/or cover.*) in the persona dir (auto-picked up),
+#                   or pass --avatar / --cover <path>. Cover = the band behind the avatar on the card page.
+#                   Uploaded on every deploy run, skipped when the file's md5 matches the last upload
+#   knowledge housekeeping (upload is ADDITIVE — deleting a file locally does NOT remove it online):
+#                   python deploy.py --src <dir> --rm-knowledge <path>          # one file, or a whole folder
+#                   python deploy.py --src <dir> --mv-knowledge <src> <dest>    # move / rename, file or folder
+#                   python deploy.py --src <dir> --prune-knowledge              # delete whatever is no longer local
+#                   prefer --prune-knowledge over --replace-knowledge: it only touches what is actually
+#                   gone, instead of deleting and re-uploading everything (slow, and half-done on failure)
 #   set handle:     python deploy.py --src <dir> --set-handle <slug>               # checked first; SET ONCE, locked after
 #                     (also sets the agent's email address to <slug>@talkto.bio — same slug, confirmed together;
 #                      re-run with the SAME slug to repair older agents that got a handle but no email)
@@ -44,6 +51,10 @@
 #                                                   ("dir/sub/doc.md"); images: single segment only
 #                                                   (images are OCR'd into readable text automatically)
 #   /api/knowledge-docs/delete {agentId, filename, isImage?}    folder path ok
+#   /api/knowledge-docs/folder/delete {agentId, path}   removes the whole subtree (docs, images, OCR copies)
+#   /api/knowledge-docs/move {agentId, sourcePath, destinationPath, kind:"file"|"folder", isImage?}
+#                                                   rename/move; the server keeps the OCR sidecar in step
+#   /api/agents/cover {agentId, base64, contentType}    card-page cover image, same limits as /avatar
 #   /api/agent-skills/upload?agentId=&skillName=&path=   raw file bytes; path may contain subdirs
 #       limits: 2MB/file, 100 files and 20MB total per agent; skillName matches ^[a-z0-9][a-z0-9_-]{0,63}$
 #   /api/agent-skills/delete {agentId, skillName}   deletes the whole skill — used by --replace-skills, because
@@ -178,6 +189,16 @@ def main() -> None:
                     help="share card shape: timeline = 1:1 (default), friend = 5:4")
     ap.add_argument("--plain-code", action="store_true",
                     help="with --qrcode: write the bare mini-program code instead of the whole card")
+    ap.add_argument("--cover", metavar="IMG",
+                    help="cover image (the band behind the avatar on the card page); "
+                         "or drop cover.png|jpg|jpeg|webp in the persona dir")
+    ap.add_argument("--rm-knowledge", metavar="PATH",
+                    help="delete ONE knowledge file or a whole folder, by its path under knowledge/")
+    ap.add_argument("--mv-knowledge", nargs=2, metavar=("SRC", "DEST"),
+                    help="move or rename a knowledge file / folder, paths relative to knowledge/")
+    ap.add_argument("--prune-knowledge", action="store_true",
+                    help="delete remote knowledge that is no longer in the local knowledge/ dir "
+                         "(upload is additive, so deleting a file locally does NOT remove it online)")
     ap.add_argument("--replace-skills", action="store_true", help="delete each skill before uploading")
     ap.add_argument("--replace-knowledge", action="store_true", help="delete existing knowledge files before uploading")
     args = ap.parse_args()
@@ -333,6 +354,106 @@ def main() -> None:
         write_manifest({"agentId": agent_id, "handle": args.set_handle})
         print(f"handle set: talkto.bio/{args.set_handle}  (locked — it can never be changed)")
         print(f"email set:  {args.set_handle}@talkto.bio")
+        return
+
+    # ---- knowledge housekeeping: delete / move / prune ----
+    # 上传是**只增不减**的：本地删掉一个文件再 deploy 一次，线上那个文件还在。
+    # 在有这三条之前，唯一的办法是 --replace-knowledge 把线上全删了重传 —— 文件多的时候又慢又险
+    # （中途失败就只剩半个知识库），还会连用户在 App 里整理好的目录一起铲掉。
+    def knowledge_tree(agent_id: str) -> tuple[dict, list]:
+        """线上的知识库现状：{文件名: 是不是图片} + 目录清单。
+
+        includeNested 必须传：不传的话只返回顶层，子目录里的文件看不见 —— 那正是"删了却还在"
+        最容易发生的地方。folders 也只有传了它才会返回。
+        """
+        r = post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})
+        files = {f["filename"]: bool(f.get("isImage")) for f in r.get("files") or []}
+        return files, list(r.get("folders") or [])
+
+    def rm_knowledge(agent_id: str, target: str) -> None:
+        files, folders = knowledge_tree(agent_id)
+        path = target.strip().strip("/")
+        if not path:
+            sys.exit("--rm-knowledge 要一个路径，比如 old.md 或 projects/")
+        if path in files:
+            post_json("/api/knowledge-docs/delete",
+                      {"agentId": agent_id, "filename": path, "isImage": files[path]})
+            print(f"[knowledge] deleted file: {path}")
+            return
+        if path in folders:
+            # 整个子树一起没，包括里面的图片和 OCR 副本 —— 先把要删的东西数出来给人看，别默默地删
+            inside = [f for f in files if f.startswith(path + "/")]
+            post_json("/api/knowledge-docs/folder/delete", {"agentId": agent_id, "path": path})
+            print(f"[knowledge] deleted folder: {path}/ ({len(inside)} files inside)")
+            return
+        sys.exit(f"not found online: {path}\n"
+                 f"  files:   {', '.join(sorted(files)[:8]) or '(none)'}\n"
+                 f"  folders: {', '.join(sorted(folders)[:8]) or '(none)'}\n"
+                 f"  (full list: --show)")
+
+    def mv_knowledge(agent_id: str, source: str, destination: str) -> None:
+        files, folders = knowledge_tree(agent_id)
+        src_path, dest_path = source.strip().strip("/"), destination.strip().strip("/")
+        if not src_path or not dest_path:
+            sys.exit("--mv-knowledge 要两个路径：源和目标")
+        if src_path == dest_path:
+            print(f"[knowledge] {src_path} 已经在目标位置，没动")
+            return
+        if src_path in files:
+            kind, is_image = "file", files[src_path]
+        elif src_path in folders:
+            kind, is_image = "folder", False
+        else:
+            sys.exit(f"not found online: {src_path} (full list: --show)")
+        # 同名冲突服务端也会挡，但先在本地判一次：省一次往返，而且话说得更准
+        if dest_path in files or dest_path in folders:
+            sys.exit(f"target already exists: {dest_path}")
+        post_json("/api/knowledge-docs/move", {
+            "agentId": agent_id, "sourcePath": src_path, "destinationPath": dest_path,
+            "kind": kind, "isImage": is_image,
+        })
+        print(f"[knowledge] moved {kind}: {src_path} -> {dest_path}")
+
+    def prune_knowledge(agent_id: str, kdir: Path) -> None:
+        """让线上跟本地 knowledge/ 对齐：删掉本地已经没有的。
+
+        与 --replace-knowledge 的区别：那个是全删重传，这个**只动多出来的**，没变的文件一个不碰。
+        本地没有 knowledge/ 目录时直接拒绝 —— 那多半是跑错了目录，而不是"我要清空线上"。
+        """
+        if not kdir.is_dir():
+            sys.exit(f"no local knowledge/ dir at {kdir} — refusing to prune "
+                     "(an empty local dir would delete everything online; create it explicitly if that is what you mean)")
+        local_files = {p.relative_to(kdir).as_posix() for p in kdir.rglob("*") if p.is_file()}
+        local_dirs = {p.relative_to(kdir).as_posix() for p in kdir.rglob("*") if p.is_dir()}
+        files, folders = knowledge_tree(agent_id)
+
+        gone = sorted(name for name in files if name not in local_files)
+        for name in gone:
+            post_json("/api/knowledge-docs/delete",
+                      {"agentId": agent_id, "filename": name, "isImage": files[name]})
+            print(f"[prune] deleted file: {name}")
+        # 文件删完之后再收目录，而且从深到浅 —— 先删父目录的话，子目录会跟着没，日志就对不上了
+        empty = sorted((f for f in folders if f not in local_dirs), key=lambda f: f.count("/"), reverse=True)
+        for folder in empty:
+            post_json("/api/knowledge-docs/folder/delete", {"agentId": agent_id, "path": folder})
+            print(f"[prune] deleted folder: {folder}/")
+        if not gone and not empty:
+            print("[prune] nothing to delete — online already matches the local knowledge/ dir")
+        else:
+            print(f"[prune] {len(gone)} file(s), {len(empty)} folder(s) removed")
+
+    if args.rm_knowledge:
+        rm_knowledge(resolve_agent_id(required=True), args.rm_knowledge)
+        return
+
+    if args.mv_knowledge:
+        mv_knowledge(resolve_agent_id(required=True), args.mv_knowledge[0], args.mv_knowledge[1])
+        return
+
+    if args.prune_knowledge:
+        if not args.src:
+            sys.exit("--prune-knowledge 需要 --src：要跟哪个目录对齐")
+        prune_knowledge(resolve_agent_id(required=True), Path(args.src) / "knowledge")
         return
 
     # ---- card copy: the blurb, the tags and the three questions the visitor sees ----
@@ -503,18 +624,41 @@ def main() -> None:
     def etag_of(f: dict) -> str:
         return (f.get("etag") or "").strip('"').lower()
 
-    def resolve_avatar() -> Path | None:
-        """--avatar wins; otherwise avatar.<ext> sitting in the persona dir (same convention as soul.md)."""
-        if args.avatar:
-            p = Path(args.avatar)
+    def resolve_image(kind: str, override: str | None) -> Path | None:
+        """--avatar/--cover wins; otherwise <kind>.<ext> sitting in the persona dir (same convention as soul.md)."""
+        if override:
+            p = Path(override)
             if not p.is_file():
-                sys.exit(f"avatar not found: {p}")
+                sys.exit(f"{kind} not found: {p}")
             return p
         hits = sorted(p for p in src.iterdir()
-                      if p.is_file() and p.stem.lower() == "avatar" and p.suffix.lower() in AVATAR_TYPES)
+                      if p.is_file() and p.stem.lower() == kind and p.suffix.lower() in AVATAR_TYPES)
         if len(hits) > 1:
-            sys.exit(f"multiple avatar files in {src}: {[p.name for p in hits]} — keep one, or pass --avatar")
+            sys.exit(f"multiple {kind} files in {src}: {[p.name for p in hits]} — keep one, or pass --{kind}")
         return hits[0] if hits else None
+
+    def upload_agent_image(kind: str, path: Path, endpoint: str, manifest_key: str) -> None:
+        """头像和封面是同一条路：同样的格式和大小限制、同样按 md5 跳过重传。
+
+        每次上传都写一个**新的**对象 key，所以不跳过的话每跑一次 deploy 就在 OSS 上多一份死对象。
+        """
+        content_type = AVATAR_TYPES.get(path.suffix.lower())
+        if not content_type:
+            sys.exit(f"unsupported {kind} type: {path.name} (only jpg/jpeg/png/webp)")
+        data = path.read_bytes()
+        if len(data) > AVATAR_MAX_BYTES:
+            sys.exit(f"{kind} too large ({len(data)}B > 5MB): {path} — compress it first")
+        digest = md5_hex(data)
+        if read_manifest().get(manifest_key) == digest:
+            print(f"[{kind}] {path.name} unchanged, skipped")
+            return
+        r = post_json(endpoint, {
+            "agentId": agent_id,
+            "base64": b64.b64encode(data).decode("ascii"),
+            "contentType": content_type,
+        })
+        write_manifest({manifest_key: digest})
+        print(f"[{kind}] {path.name} ({len(data)}B) -> {r['url']}")
 
     agent_id = resolve_agent_id(required=False)
     if agent_id:
@@ -531,27 +675,14 @@ def main() -> None:
         write_manifest({"agentId": agent_id, "name": persona["agentName"]})
         print(f"[create] agentId={agent_id} name={persona['agentName']} soulChars={len(persona['soulContent'])}")
 
-    # avatar: optional; each upload writes a NEW object key, so skip when the file's md5 matches the
-    # last one we sent (recorded in .talktome.json) — keeps re-runs from piling up dead objects on OSS
-    avatar_path = resolve_avatar()
+    # 头像和封面：都可选，都按 md5 跳过没变的
+    avatar_path = resolve_image("avatar", args.avatar)
     if avatar_path:
-        content_type = AVATAR_TYPES.get(avatar_path.suffix.lower())
-        if not content_type:
-            sys.exit(f"unsupported avatar type: {avatar_path.name} (only jpg/jpeg/png/webp)")
-        avatar_bytes = avatar_path.read_bytes()
-        if len(avatar_bytes) > AVATAR_MAX_BYTES:
-            sys.exit(f"avatar too large ({len(avatar_bytes)}B > 5MB): {avatar_path} — compress it first")
-        avatar_md5 = md5_hex(avatar_bytes)
-        if read_manifest().get("avatarMd5") == avatar_md5:
-            print(f"[avatar] {avatar_path.name} unchanged, skipped")
-        else:
-            r = post_json("/api/agents/avatar", {
-                "agentId": agent_id,
-                "base64": b64.b64encode(avatar_bytes).decode("ascii"),
-                "contentType": content_type,
-            })
-            write_manifest({"avatarMd5": avatar_md5})
-            print(f"[avatar] {avatar_path.name} ({len(avatar_bytes)}B) -> {r['url']}")
+        upload_agent_image("avatar", avatar_path, "/api/agents/avatar", "avatarMd5")
+    # 封面是名片页顶部那张背景图（头像后面那一块），不是卡片本身
+    cover_path = resolve_image("cover", args.cover)
+    if cover_path:
+        upload_agent_image("cover", cover_path, "/api/agents/cover", "coverMd5")
 
     # knowledge: optional dir. Every file — documents AND images — keeps its folder structure: the
     # remote name is just the path relative to knowledge/. Images live under the server's system image/
