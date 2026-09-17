@@ -9,8 +9,6 @@
 # --list recovers a lost mapping (match by name).
 #
 # Usage (token is read from <skill>/.env once saved — pass --token only to override):
-#   pick the env:   login.py --base <url> records it in .env; every later deploy.py command reuses it.
-#                   Test env: https://int-backend.talkto.bio  (its accounts are SEPARATE from prod's)
 #   save session:   python deploy.py --save-token <accessToken> <refreshToken>     # right after the SMS login
 #   deploy:         python deploy.py --src <persona-dir> [--name <n>] [--avatar <img>]
 #   resume/update:  python deploy.py --src <persona-dir>                           # agentId auto-read from .talktome.json
@@ -168,7 +166,7 @@ def main() -> None:
     ap.add_argument("--token", help="Bearer access token (default: TALKTOME_ACCESS_TOKEN from <skill>/.env)")
     ap.add_argument("--save-token", nargs=2, metavar=("ACCESS", "REFRESH"),
                     help="store a token pair into <skill>/.env and exit (run right after the SMS login)")
-    ap.add_argument("--base", help=f"API base URL (default: whatever login.py logged into, else {DEFAULT_BASE})")
+    ap.add_argument("--base", default=DEFAULT_BASE, help=f"API base URL (default {DEFAULT_BASE})")
     ap.add_argument("--src", help="persona dir (soul.md required; greeting/knowledge/skills optional)")
     ap.add_argument("--agent-id", help="existing agent uuid (resume/update/set-handle/publish)")
     ap.add_argument("--name", help="agent name (default: name: in config.yaml if present, else dir name)")
@@ -209,25 +207,14 @@ def main() -> None:
     ap.add_argument("--replace-knowledge", action="store_true", help="delete existing knowledge files before uploading")
     args = ap.parse_args()
 
-    # base 的来源：命令行 > 登录时记在 .env 里的 > prod 默认。
-    # 记在 .env 里是为了只定一次 —— 每条命令都手写 --base，迟早有一条忘了，
-    # 那一条就悄悄打到 prod 上去了（token 是对不上的，但报的 401 看不出原因）。
-    env = read_env()
-    logged_in_base = (env.get("TALKTOME_API_BASE") or "").rstrip("/")
-    base = (args.base or logged_in_base or DEFAULT_BASE).rstrip("/")
+    base = args.base.rstrip("/")
 
     if args.save_token:
-        write_env({"TALKTOME_ACCESS_TOKEN": args.save_token[0], "TALKTOME_REFRESH_TOKEN": args.save_token[1],
-                   "TALKTOME_API_BASE": base})
-        print(f"tokens saved to {ENV_PATH} (base={base})")
+        write_env({"TALKTOME_ACCESS_TOKEN": args.save_token[0], "TALKTOME_REFRESH_TOKEN": args.save_token[1]})
+        print(f"tokens saved to {ENV_PATH}")
         return
 
-    # 手写的 --base 和登录时那个对不上 = 拿着 A 环境的 token 去打 B 环境。
-    # 服务端只会回一个 401，从外面完全看不出是"环境搞错了"还是"token 过期了"。
-    if args.base and logged_in_base and base != logged_in_base:
-        sys.exit(f"token mismatch: .env 里的会话是 {logged_in_base} 登录的，而 --base 指向 {base}\n"
-                 f"  先用 login.py --base {base} 登录那个环境，或者去掉 --base 用回 {logged_in_base}")
-
+    env = read_env()
     token = args.token or env.get("TALKTOME_ACCESS_TOKEN")
     if not token:
         sys.exit("no token: run the SMS login then `--save-token <access> <refresh>` (or pass --token)")

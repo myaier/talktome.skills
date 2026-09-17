@@ -120,18 +120,6 @@ python scripts/deploy.py --src <目录> --rm-skill <技能名> <文件>   # 只�
 技能名或文件名对不上时命令会当场报错并列出线上有哪些，不会发一个删不到东西的请求。
 删 `SKILL.md` 会告警：那是技能的入口，没有它 xchat 不再加载这个技能，剩下的文件只是死数据。
 
-### 换环境（测试用）
-
-默认打 prod。要连测试环境，**在登录那一步指定，之后所有命令自动沿用**：
-
-```bash
-python scripts/login.py --base https://int-backend.talkto.bio   # 用户本人输手机号+验证码
-python scripts/deploy.py --list                                 # 不用再写 --base
-```
-
-base 会跟 token 一起记进 `.env`。两个环境的**账号是分开的**，所以要分别登录；手写的 `--base`
-和登录时那个不一致时脚本会当场拦住——拿 A 环境的 token 打 B 环境只会收到一个看不出原因的 401。
-
 ## 第四步：handle 与发布（两步都必须用户确认）
 
 1. **请用户起主页名 handle**（即 `talkto.bio/{handle}`），然后校验并设置：
