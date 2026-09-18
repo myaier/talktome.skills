@@ -15,12 +15,27 @@
 #                     [--update-persona]     also push name/soul/greeting changes to the existing agent
 #                     [--replace-skills]     delete each skill first (use when skill files were renamed/removed)
 #                     [--replace-knowledge]  delete existing knowledge files first (same reason)
-#   avatar:         put avatar.png|jpg|jpeg|webp in the persona dir (auto-picked up), or pass --avatar <path>;
-#                   uploaded on every deploy run, skipped when the file's md5 matches the last upload
+#   avatar/cover:   put avatar.png|jpg|jpeg|webp (and/or cover.*) in the persona dir (auto-picked up),
+#                   or pass --avatar / --cover <path>. Cover = the band behind the avatar on the card page.
+#                   Uploaded on every deploy run, skipped when the file's md5 matches the last upload
+#   knowledge housekeeping (upload is ADDITIVE — deleting a file locally does NOT remove it online):
+#                   python deploy.py --src <dir> --rm-knowledge <path>          # one file, or a whole folder
+#                   python deploy.py --src <dir> --mv-knowledge <src> <dest>    # move / rename, file or folder
+#                   python deploy.py --src <dir> --prune-knowledge              # delete whatever is no longer local
+#   skills:         python deploy.py --src <dir> --rm-skill <name> [path]       # whole skill, or one file in it
+#                   prefer --prune-knowledge over --replace-knowledge: it only touches what is actually
+#                   gone, instead of deleting and re-uploading everything (slow, and half-done on failure)
 #   set handle:     python deploy.py --src <dir> --set-handle <slug>               # checked first; SET ONCE, locked after
 #                     (also sets the agent's email address to <slug>@talkto.bio — same slug, confirmed together;
 #                      re-run with the SAME slug to repair older agents that got a handle but no email)
 #   publish:        python deploy.py --src <dir> --publish                         # outward-facing: confirm with the owner first
+#   card copy:      python deploy.py --src <dir> --card-copy                       # generate/poll the AI draft -> writes <dir>/card.json
+#                   (edit card.json WITH the owner, then:)
+#                   python deploy.py --src <dir> --set-card                        # save intro + tags + the three questions
+#   share card:     python deploy.py --src <dir> --qrcode [out.png]                # THE deliverable: the card image
+#                     the same card the app shares (avatar + blurb + tags) with the mini-program code
+#                     in the corner. Published agents only. Bare code without the card: --plain-code
+#   socials:        put "socials" in card.json (see --set-card) — website / weibo / xhs / github links
 #   list agents:    python deploy.py --list                                        # name / agentId / handle / status
 #   show config:    python deploy.py --src <dir> --show                            # profile + soul + greeting + file inventory
 # Expired access tokens refresh automatically (rotating refresh token, persisted back to .env).
@@ -37,11 +52,34 @@
 #                                                   ("dir/sub/doc.md"); images: single segment only
 #                                                   (images are OCR'd into readable text automatically)
 #   /api/knowledge-docs/delete {agentId, filename, isImage?}    folder path ok
+#   /api/knowledge-docs/folder/delete {agentId, path}   removes the whole subtree (docs, images, OCR copies)
+#   /api/knowledge-docs/move {agentId, sourcePath, destinationPath, kind:"file"|"folder", isImage?}
+#                                                   rename/move; the server keeps the OCR sidecar in step
+#   /api/agents/cover {agentId, base64, contentType}    card-page cover image, same limits as /avatar
 #   /api/agent-skills/upload?agentId=&skillName=&path=   raw file bytes; path may contain subdirs
 #       limits: 2MB/file, 100 files and 20MB total per agent; skillName matches ^[a-z0-9][a-z0-9_-]{0,63}$
-#   /api/agent-skills/delete {agentId, skillName}   deletes the whole skill — used by --replace-skills, because
-#                                                   the platform sync is additive (renamed/removed files would linger)
+#   /api/agent-skills/delete {agentId, skillName, path?}   path given → that one file; omitted → the whole
+#                                                   skill. Used by --rm-skill and --replace-skills, because the
+#                                                   platform sync is additive (renamed/removed files would linger)
 #   /api/knowledge-docs/list, /api/agent-skills/list  {agentId}  -> verification
+#   /api/agents/card-copy/ensure, /api/agents/card-copy/status  {agentId}
+#                                                   -> {state, confirmed:{intro,tags,questions}, draft:{...}}
+#                                                   state=generating means a job is ALREADY running: poll
+#                                                   /status, do not submit again
+#   /api/agents/update   ... also takes {shareIntro<=100, shareTags<=3 x<=6 chars,
+#                                        suggestedQuestions: exactly 3, distinct, each <=30 chars}
+#                                        the three must be sent TOGETHER — the server takes the whole card
+#                                        or nothing (a questions-only write would stamp an intro nobody read
+#                                        as confirmed)
+#   /api/agents/update   ... also takes {socials: [{platform, url, label?}]} — up to 50; platform<=50,
+#                                        url<=500, label<=100 chars. Replaces the whole list, so send
+#                                        every link you want kept, not just the new one.
+#   /api/agents/share-card {agentId, ratio?}        -> {imageBase64, contentType, scene, hasQrCode}
+#                                                   the shareable card PNG, rendered server-side;
+#                                                   ratio "timeline" (1:1, default) | "friend" (5:4)
+#                                                   published agents only
+#   /api/agents/miniprogram-code {agentId}          -> {imageBase64, contentType, scene, envVersion}
+#                                                   the bare code, no card. published agents only
 import argparse
 import base64 as b64
 import hashlib
@@ -49,6 +87,7 @@ import json
 import mimetypes
 import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -58,6 +97,12 @@ DEFAULT_BASE = "https://prod-backend.talkto.bio"
 SKIP_SKILL_DIRS = {"scripts"}  # skill script files are not used in online chat; skip to keep the sync light
 # Avatar formats the backend accepts (POST /api/agents/avatar); keys double as the auto-detect extensions
 AVATAR_TYPES = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}
+# Card limits, mirrored from the backend so a bad card.json fails here with a readable message
+# instead of coming back as a 400 the agent then has to decode.
+CARD_INTRO_MAX, CARD_TAGS_MAX, CARD_TAG_LEN_MAX = 100, 3, 6
+CARD_QUESTIONS, CARD_QUESTION_MAX = 3, 30
+CARD_COPY_POLL_SECONDS, CARD_COPY_TIMEOUT_SECONDS = 2, 90
+SOCIALS_MAX, SOCIAL_PLATFORM_MAX, SOCIAL_URL_MAX, SOCIAL_LABEL_MAX = 50, 50, 500, 100
 AVATAR_MAX_BYTES = 5 * 1024 * 1024  # server limit; check locally so an oversized file fails before the upload
 
 # Session storage: <skill-dir>/.env (gitignored). Written after the SMS login, then reused by every run —
@@ -81,6 +126,41 @@ def write_env(patch: dict) -> None:
     ENV_PATH.write_text("".join(f"{k}={v}\n" for k, v in env.items()), encoding="utf-8")
 
 
+def parse_socials(card: dict) -> "list[dict] | None":
+    """card.json's optional "socials" -> the API's [{platform, url, label?}].
+
+    Returns None when the key is absent, which the caller uses to mean "do not touch the links".
+    Limits mirror the server's so a bad entry fails here, where the message can name the field.
+    """
+    raw = card.get("socials")
+    if raw is None:
+        return None
+    if not isinstance(raw, list):
+        sys.exit('card.json "socials" must be a list of {"platform": ..., "url": ...}')
+    if len(raw) > SOCIALS_MAX:
+        sys.exit(f"at most {SOCIALS_MAX} social links (got {len(raw)})")
+    out = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            sys.exit(f'card.json "socials" entries must be objects: {entry!r}')
+        platform = str(entry.get("platform") or "").strip()
+        url = str(entry.get("url") or "").strip()
+        label = str(entry.get("label") or "").strip()
+        if not platform or not url:
+            sys.exit(f'each social link needs a non-empty "platform" and "url": {entry!r}')
+        if len(platform) > SOCIAL_PLATFORM_MAX:
+            sys.exit(f"platform must be <= {SOCIAL_PLATFORM_MAX} chars: {platform}")
+        if len(url) > SOCIAL_URL_MAX:
+            sys.exit(f"url must be <= {SOCIAL_URL_MAX} chars: {url[:60]}...")
+        if len(label) > SOCIAL_LABEL_MAX:
+            sys.exit(f"label must be <= {SOCIAL_LABEL_MAX} chars: {label}")
+        item = {"platform": platform, "url": url}
+        if label:
+            item["label"] = label
+        out.append(item)
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--token", help="Bearer access token (default: TALKTOME_ACCESS_TOKEN from <skill>/.env)")
@@ -99,6 +179,30 @@ def main() -> None:
     ap.add_argument("--list", action="store_true", help="list this account's agents (name / agentId / handle / status)")
     ap.add_argument("--show", action="store_true",
                     help="print the agent's current server-side config: profile + soul + greeting + knowledge/skill inventory")
+    ap.add_argument("--card-copy", action="store_true",
+                    help="generate (or fetch) the AI draft of the card blurb, tags and three questions; "
+                         "writes <src>/card.json for the owner to edit")
+    ap.add_argument("--set-card", action="store_true",
+                    help="save <src>/card.json (intro + tags + the three questions) as the confirmed card")
+    ap.add_argument("--qrcode", nargs="?", const="", metavar="OUT.PNG",
+                    help="write the shareable card image (blurb + tags + mini-program code) to a PNG "
+                         "(default <src>/share-card.png); published agents only")
+    ap.add_argument("--card-ratio", choices=["timeline", "friend"], default="timeline",
+                    help="share card shape: timeline = 1:1 (default), friend = 5:4")
+    ap.add_argument("--plain-code", action="store_true",
+                    help="with --qrcode: write the bare mini-program code instead of the whole card")
+    ap.add_argument("--cover", metavar="IMG",
+                    help="cover image (the band behind the avatar on the card page); "
+                         "or drop cover.png|jpg|jpeg|webp in the persona dir")
+    ap.add_argument("--rm-knowledge", metavar="PATH",
+                    help="delete ONE knowledge file or a whole folder, by its path under knowledge/")
+    ap.add_argument("--mv-knowledge", nargs=2, metavar=("SRC", "DEST"),
+                    help="move or rename a knowledge file / folder, paths relative to knowledge/")
+    ap.add_argument("--prune-knowledge", action="store_true",
+                    help="delete remote knowledge that is no longer in the local knowledge/ dir "
+                         "(upload is additive, so deleting a file locally does NOT remove it online)")
+    ap.add_argument("--rm-skill", nargs="+", metavar=("SKILL", "PATH"),
+                    help="delete a whole skill, or just one file inside it: --rm-skill <name> [path]")
     ap.add_argument("--replace-skills", action="store_true", help="delete each skill before uploading")
     ap.add_argument("--replace-knowledge", action="store_true", help="delete existing knowledge files before uploading")
     args = ap.parse_args()
@@ -256,6 +360,251 @@ def main() -> None:
         print(f"email set:  {args.set_handle}@talkto.bio")
         return
 
+    # ---- knowledge housekeeping: delete / move / prune ----
+    # 上传是**只增不减**的：本地删掉一个文件再 deploy 一次，线上那个文件还在。
+    # 在有这三条之前，唯一的办法是 --replace-knowledge 把线上全删了重传 —— 文件多的时候又慢又险
+    # （中途失败就只剩半个知识库），还会连用户在 App 里整理好的目录一起铲掉。
+    def knowledge_tree(agent_id: str) -> tuple[dict, list]:
+        """线上的知识库现状：{文件名: 是不是图片} + 目录清单。
+
+        includeNested 必须传：不传的话只返回顶层，子目录里的文件看不见 —— 那正是"删了却还在"
+        最容易发生的地方。folders 也只有传了它才会返回。
+        """
+        r = post_json("/api/knowledge-docs/list", {"agentId": agent_id, "includeNested": True})
+        files = {f["filename"]: bool(f.get("isImage")) for f in r.get("files") or []}
+        return files, list(r.get("folders") or [])
+
+    def rm_knowledge(agent_id: str, target: str) -> None:
+        files, folders = knowledge_tree(agent_id)
+        path = target.strip().strip("/")
+        if not path:
+            sys.exit("--rm-knowledge 要一个路径，比如 old.md 或 projects/")
+        if path in files:
+            post_json("/api/knowledge-docs/delete",
+                      {"agentId": agent_id, "filename": path, "isImage": files[path]})
+            print(f"[knowledge] deleted file: {path}")
+            return
+        if path in folders:
+            # 整个子树一起没，包括里面的图片和 OCR 副本 —— 先把要删的东西数出来给人看，别默默地删
+            inside = [f for f in files if f.startswith(path + "/")]
+            post_json("/api/knowledge-docs/folder/delete", {"agentId": agent_id, "path": path})
+            print(f"[knowledge] deleted folder: {path}/ ({len(inside)} files inside)")
+            return
+        sys.exit(f"not found online: {path}\n"
+                 f"  files:   {', '.join(sorted(files)[:8]) or '(none)'}\n"
+                 f"  folders: {', '.join(sorted(folders)[:8]) or '(none)'}\n"
+                 f"  (full list: --show)")
+
+    def mv_knowledge(agent_id: str, source: str, destination: str) -> None:
+        files, folders = knowledge_tree(agent_id)
+        src_path, dest_path = source.strip().strip("/"), destination.strip().strip("/")
+        if not src_path or not dest_path:
+            sys.exit("--mv-knowledge 要两个路径：源和目标")
+        if src_path == dest_path:
+            print(f"[knowledge] {src_path} 已经在目标位置，没动")
+            return
+        if src_path in files:
+            kind, is_image = "file", files[src_path]
+        elif src_path in folders:
+            kind, is_image = "folder", False
+        else:
+            sys.exit(f"not found online: {src_path} (full list: --show)")
+        # 同名冲突服务端也会挡，但先在本地判一次：省一次往返，而且话说得更准
+        if dest_path in files or dest_path in folders:
+            sys.exit(f"target already exists: {dest_path}")
+        post_json("/api/knowledge-docs/move", {
+            "agentId": agent_id, "sourcePath": src_path, "destinationPath": dest_path,
+            "kind": kind, "isImage": is_image,
+        })
+        print(f"[knowledge] moved {kind}: {src_path} -> {dest_path}")
+
+    def prune_knowledge(agent_id: str, kdir: Path) -> None:
+        """让线上跟本地 knowledge/ 对齐：删掉本地已经没有的。
+
+        与 --replace-knowledge 的区别：那个是全删重传，这个**只动多出来的**，没变的文件一个不碰。
+        本地没有 knowledge/ 目录时直接拒绝 —— 那多半是跑错了目录，而不是"我要清空线上"。
+        """
+        if not kdir.is_dir():
+            sys.exit(f"no local knowledge/ dir at {kdir} — refusing to prune "
+                     "(an empty local dir would delete everything online; create it explicitly if that is what you mean)")
+        local_files = {p.relative_to(kdir).as_posix() for p in kdir.rglob("*") if p.is_file()}
+        local_dirs = {p.relative_to(kdir).as_posix() for p in kdir.rglob("*") if p.is_dir()}
+        files, folders = knowledge_tree(agent_id)
+
+        gone = sorted(name for name in files if name not in local_files)
+        for name in gone:
+            post_json("/api/knowledge-docs/delete",
+                      {"agentId": agent_id, "filename": name, "isImage": files[name]})
+            print(f"[prune] deleted file: {name}")
+        # 文件删完之后再收目录，而且从深到浅 —— 先删父目录的话，子目录会跟着没，日志就对不上了
+        empty = sorted((f for f in folders if f not in local_dirs), key=lambda f: f.count("/"), reverse=True)
+        for folder in empty:
+            post_json("/api/knowledge-docs/folder/delete", {"agentId": agent_id, "path": folder})
+            print(f"[prune] deleted folder: {folder}/")
+        if not gone and not empty:
+            print("[prune] nothing to delete — online already matches the local knowledge/ dir")
+        else:
+            print(f"[prune] {len(gone)} file(s), {len(empty)} folder(s) removed")
+
+    if args.rm_knowledge:
+        rm_knowledge(resolve_agent_id(required=True), args.rm_knowledge)
+        return
+
+    if args.mv_knowledge:
+        mv_knowledge(resolve_agent_id(required=True), args.mv_knowledge[0], args.mv_knowledge[1])
+        return
+
+    if args.prune_knowledge:
+        if not args.src:
+            sys.exit("--prune-knowledge 需要 --src：要跟哪个目录对齐")
+        prune_knowledge(resolve_agent_id(required=True), Path(args.src) / "knowledge")
+        return
+
+    # ---- skills housekeeping ----
+    # 技能的同步和知识库一样是**只增不减**的：xchat 把技能同步进工作区之后，本地删掉的文件
+    # 不会从那份副本里消失。所以删一个技能文件也要显式来。
+    def rm_skill(agent_id: str, skill_name: str, path: str | None) -> None:
+        skills = {s["skillName"]: s for s in post_json("/api/agent-skills/list", {"agentId": agent_id})["skills"]}
+        if skill_name not in skills:
+            sys.exit(f"no such skill online: {skill_name} "
+                     f"(have: {', '.join(sorted(skills)) or '(none)'}; full list: --show)")
+        if path is None:
+            r = post_json("/api/agent-skills/delete", {"agentId": agent_id, "skillName": skill_name})
+            print(f"[skill] deleted {skill_name}: {r.get('deleted', 0)} files")
+            return
+        known = {f["path"] for f in skills[skill_name]["files"]}
+        if path not in known:
+            sys.exit(f"no such file in {skill_name}: {path} "
+                     f"(have: {', '.join(sorted(known)[:8]) or '(none)'})")
+        # SKILL.md 是这个技能的入口：没有它 xchat 不会把目录注册成技能，只当一堆死数据。
+        # 允许删，但要说清楚 —— 删完还剩别的文件时，用户多半不是想让技能失效。
+        if path == "SKILL.md" and len(known) > 1:
+            print(f"[skill] WARNING: {skill_name}/SKILL.md 是入口文件，删掉之后这个技能不再被加载，"
+                  f"剩下的 {len(known) - 1} 个文件只是死数据")
+        post_json("/api/agent-skills/delete", {"agentId": agent_id, "skillName": skill_name, "path": path})
+        print(f"[skill] deleted {skill_name}/{path}")
+
+    if args.rm_skill:
+        if len(args.rm_skill) > 2:
+            sys.exit("--rm-skill 最多两个参数：技能名，以及可选的技能内文件路径")
+        rm_skill(resolve_agent_id(required=True), args.rm_skill[0],
+                 args.rm_skill[1] if len(args.rm_skill) > 1 else None)
+        return
+
+    # ---- card copy: the blurb, the tags and the three questions the visitor sees ----
+    # Three separate columns server-side, and the AI only ever writes the *draft* ones. What goes
+    # public is whatever the owner confirms here — so this is two commands on purpose: --card-copy
+    # fetches the draft, the owner edits card.json, --set-card writes it.
+    def card_path() -> Path:
+        if not args.src:
+            sys.exit("--src required: card.json lives in the persona dir")
+        return Path(args.src) / "card.json"
+
+    if args.card_copy:
+        agent_id = resolve_agent_id(required=True)
+        status = post_json("/api/agents/card-copy/ensure", {"agentId": agent_id})
+        waited = 0
+        # state=generating means a job is already running (possibly started by saving the agent).
+        # Poll /status rather than submitting again — a second submit is a second LLM call.
+        while status.get("state") == "generating" and waited < CARD_COPY_TIMEOUT_SECONDS:
+            time.sleep(CARD_COPY_POLL_SECONDS)
+            waited += CARD_COPY_POLL_SECONDS
+            status = post_json("/api/agents/card-copy/status", {"agentId": agent_id})
+        draft, confirmed = status.get("draft") or {}, status.get("confirmed") or {}
+        # Draft first: it was written against the CURRENT material, so after the owner edits the
+        # persona this is the version that reflects it. Fall back to what is already public.
+        card = draft if draft.get("intro") else confirmed
+        if not card.get("intro"):
+            sys.exit(f"no card copy yet (state={status.get('state')}) — retry, or write card.json by hand")
+        out = card_path()
+        # Re-running this overwrites card.json, so carry over the parts the AI does not write.
+        # socials is the owner's own list of links — losing it because they asked for a fresh
+        # blurb would be a nasty surprise.
+        payload = {
+            "intro": card.get("intro", ""),
+            "tags": card.get("tags") or [],
+            "questions": card.get("questions") or [],
+        }
+        if out.is_file():
+            try:
+                previous = json.loads(out.read_text(encoding="utf-8"))
+            except ValueError:
+                previous = {}
+            if isinstance(previous, dict) and previous.get("socials") is not None:
+                payload["socials"] = previous["socials"]
+        out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"card draft written: {out}")
+        print("  intro:     " + card.get("intro", ""))
+        print("  tags:      " + (" / ".join(card.get("tags") or []) or "-"))
+        for i, q in enumerate(card.get("questions") or [], 1):
+            print(f"  question{i}: {q}")
+        print()
+        print("GO THROUGH IT WITH THE OWNER, edit card.json, then: --set-card")
+        return
+
+    if args.set_card:
+        agent_id = resolve_agent_id(required=True)
+        path = card_path()
+        if not path.is_file():
+            sys.exit(f"card.json not found: {path} — run --card-copy first, or write it by hand")
+        try:
+            card = json.loads(path.read_text(encoding="utf-8"))
+        except ValueError as exc:
+            sys.exit(f"card.json is not valid JSON: {exc}")
+        intro = str(card.get("intro") or "").strip()
+        tags = [str(t).strip() for t in (card.get("tags") or []) if str(t).strip()]
+        questions = [str(q).strip() for q in (card.get("questions") or []) if str(q).strip()]
+        # Checked here so the failure names the field. The server enforces the same limits.
+        if not intro or len(intro) > CARD_INTRO_MAX:
+            sys.exit(f"intro must be 1-{CARD_INTRO_MAX} chars (got {len(intro)})")
+        if len(tags) > CARD_TAGS_MAX or any(len(t) > CARD_TAG_LEN_MAX for t in tags):
+            sys.exit(f"at most {CARD_TAGS_MAX} tags, each <= {CARD_TAG_LEN_MAX} chars: {tags}")
+        if len(questions) != CARD_QUESTIONS or len(set(questions)) != CARD_QUESTIONS:
+            sys.exit(f"exactly {CARD_QUESTIONS} distinct questions required (got {len(questions)}, "
+                     f"{len(set(questions))} distinct)")
+        too_long = [q for q in questions if len(q) > CARD_QUESTION_MAX]
+        if too_long:
+            # They sit one per line on the card and are tapped, not read — length is a layout constraint
+            sys.exit(f"each question must be <= {CARD_QUESTION_MAX} chars: {too_long}")
+        payload = {
+            "agentId": agent_id, "shareIntro": intro, "shareTags": tags, "suggestedQuestions": questions,
+        }
+        socials = parse_socials(card)
+        # Only sent when the key is present: the server REPLACES the whole list, so treating a missing
+        # key as an empty list would silently wipe links the owner set elsewhere (app, web).
+        if socials is not None:
+            payload["socials"] = socials
+        post_json("/api/agents/update", payload)
+        print(f"card confirmed: {intro}")
+        print("  tags:      " + (" / ".join(tags) or "-"))
+        for i, q in enumerate(questions, 1):
+            print(f"  question{i}: {q}")
+        if socials is not None:
+            print("  socials:   " + (" / ".join(f"{x['platform']}={x['url']}" for x in socials) or "(cleared)"))
+        return
+
+    if args.qrcode is not None:
+        agent_id = resolve_agent_id(required=True)
+        # The card, not the bare code. A naked QR tells nobody who is behind it; the card carries the
+        # name, the blurb and the tags, so it works as a message on its own. Run --set-card first —
+        # the card is rendered from the CONFIRMED copy, so an unconfirmed agent gets a thin one.
+        if args.plain_code:
+            result = post_json("/api/agents/miniprogram-code", {"agentId": agent_id})
+            default_name = "qrcode.png"
+            what = "mini-program code"
+        else:
+            result = post_json("/api/agents/share-card", {"agentId": agent_id, "ratio": args.card_ratio})
+            default_name = "share-card.png"
+            what = "share card"
+        out = Path(args.qrcode) if args.qrcode else (Path(args.src) / default_name if args.src else Path(default_name))
+        # The base64 string is NOT the deliverable — what the owner needs is an image they can send
+        out.write_bytes(b64.b64decode(result["imageBase64"]))
+        print(f"{what} written: {out.resolve()}  ({result.get('contentType')}, scene={result.get('scene')})")
+        if result.get("hasQrCode") is False:
+            print("WARNING: the code could not be fetched, so this card has no QR corner — re-run to retry.")
+        print("Show this image to the owner directly, together with the card link.")
+        return
+
     if args.publish:
         agent_id = resolve_agent_id(required=True)
         post_json("/api/agents/publish", {"agentId": agent_id})
@@ -310,18 +659,41 @@ def main() -> None:
     def etag_of(f: dict) -> str:
         return (f.get("etag") or "").strip('"').lower()
 
-    def resolve_avatar() -> Path | None:
-        """--avatar wins; otherwise avatar.<ext> sitting in the persona dir (same convention as soul.md)."""
-        if args.avatar:
-            p = Path(args.avatar)
+    def resolve_image(kind: str, override: str | None) -> Path | None:
+        """--avatar/--cover wins; otherwise <kind>.<ext> sitting in the persona dir (same convention as soul.md)."""
+        if override:
+            p = Path(override)
             if not p.is_file():
-                sys.exit(f"avatar not found: {p}")
+                sys.exit(f"{kind} not found: {p}")
             return p
         hits = sorted(p for p in src.iterdir()
-                      if p.is_file() and p.stem.lower() == "avatar" and p.suffix.lower() in AVATAR_TYPES)
+                      if p.is_file() and p.stem.lower() == kind and p.suffix.lower() in AVATAR_TYPES)
         if len(hits) > 1:
-            sys.exit(f"multiple avatar files in {src}: {[p.name for p in hits]} — keep one, or pass --avatar")
+            sys.exit(f"multiple {kind} files in {src}: {[p.name for p in hits]} — keep one, or pass --{kind}")
         return hits[0] if hits else None
+
+    def upload_agent_image(kind: str, path: Path, endpoint: str, manifest_key: str) -> None:
+        """头像和封面是同一条路：同样的格式和大小限制、同样按 md5 跳过重传。
+
+        每次上传都写一个**新的**对象 key，所以不跳过的话每跑一次 deploy 就在 OSS 上多一份死对象。
+        """
+        content_type = AVATAR_TYPES.get(path.suffix.lower())
+        if not content_type:
+            sys.exit(f"unsupported {kind} type: {path.name} (only jpg/jpeg/png/webp)")
+        data = path.read_bytes()
+        if len(data) > AVATAR_MAX_BYTES:
+            sys.exit(f"{kind} too large ({len(data)}B > 5MB): {path} — compress it first")
+        digest = md5_hex(data)
+        if read_manifest().get(manifest_key) == digest:
+            print(f"[{kind}] {path.name} unchanged, skipped")
+            return
+        r = post_json(endpoint, {
+            "agentId": agent_id,
+            "base64": b64.b64encode(data).decode("ascii"),
+            "contentType": content_type,
+        })
+        write_manifest({manifest_key: digest})
+        print(f"[{kind}] {path.name} ({len(data)}B) -> {r['url']}")
 
     agent_id = resolve_agent_id(required=False)
     if agent_id:
@@ -338,27 +710,14 @@ def main() -> None:
         write_manifest({"agentId": agent_id, "name": persona["agentName"]})
         print(f"[create] agentId={agent_id} name={persona['agentName']} soulChars={len(persona['soulContent'])}")
 
-    # avatar: optional; each upload writes a NEW object key, so skip when the file's md5 matches the
-    # last one we sent (recorded in .talktome.json) — keeps re-runs from piling up dead objects on OSS
-    avatar_path = resolve_avatar()
+    # 头像和封面：都可选，都按 md5 跳过没变的
+    avatar_path = resolve_image("avatar", args.avatar)
     if avatar_path:
-        content_type = AVATAR_TYPES.get(avatar_path.suffix.lower())
-        if not content_type:
-            sys.exit(f"unsupported avatar type: {avatar_path.name} (only jpg/jpeg/png/webp)")
-        avatar_bytes = avatar_path.read_bytes()
-        if len(avatar_bytes) > AVATAR_MAX_BYTES:
-            sys.exit(f"avatar too large ({len(avatar_bytes)}B > 5MB): {avatar_path} — compress it first")
-        avatar_md5 = md5_hex(avatar_bytes)
-        if read_manifest().get("avatarMd5") == avatar_md5:
-            print(f"[avatar] {avatar_path.name} unchanged, skipped")
-        else:
-            r = post_json("/api/agents/avatar", {
-                "agentId": agent_id,
-                "base64": b64.b64encode(avatar_bytes).decode("ascii"),
-                "contentType": content_type,
-            })
-            write_manifest({"avatarMd5": avatar_md5})
-            print(f"[avatar] {avatar_path.name} ({len(avatar_bytes)}B) -> {r['url']}")
+        upload_agent_image("avatar", avatar_path, "/api/agents/avatar", "avatarMd5")
+    # 封面是名片页顶部那张背景图（头像后面那一块），不是卡片本身
+    cover_path = resolve_image("cover", args.cover)
+    if cover_path:
+        upload_agent_image("cover", cover_path, "/api/agents/cover", "coverMd5")
 
     # knowledge: optional dir. Every file — documents AND images — keeps its folder structure: the
     # remote name is just the path relative to knowledge/. Images live under the server's system image/
