@@ -87,23 +87,33 @@ HTTP 层还有一个：**429 = 对方限流**，响应头 `Retry-After` 给可�
 ### 5. 身份与凭据边界
 
 - **TalkToMe 分身**：带上 `Authorization: Bearer <accessToken>`（可选，卡里 `securitySchemes.talktomeUser`
-  声明了它）。服务端凭它做三件事：解开 5 轮门控、把这条会话的访客行绑到账号、把账号手机号写给对方主人
-  当联系方式。不带就是匿名——能聊 5 轮，但主人只看到「某个 agent 问过」，联系不上。
-  匿名调用还受每分身每天 100 轮的上限；登录后不受该上限。
+  声明了它）。服务端凭它做三件事：解开匿名门控、把这条会话的访客行绑到账号、把账号手机号写给对方主人
+  当联系方式。不带就是匿名——**只能聊 1 轮**，第 2 轮起返回 `auth-required`（与网页访客同一条门控），
+  且主人只看到「某个 agent 问过」，联系不上。匿名调用还受每分身每天 100 轮的上限；登录后不受该上限。
+- **`message.metadata.via`**：可选的入口归因标记（脚本 `--via`），如 `landing_manual` = 用户从落地页
+  那段「复制给你的 AI」进来的。服务端只拿它做统计，不参与任何判断。
 - **登录 token 只发给 talkto.bio / prod-backend.talkto.bio 这两个 origin**（`is_talktome_origin()`）。
   一个"通用" A2A 客户端如果给每个 endpoint 都带 Authorization，等于把用户凭据交给他聊过的每个陌生 agent。
 - 失败**不要自动重发**——消息可能已经到达对面。
 
-### 6. 读历史
+### 6. 读历史 / 关系档案
 
 A2A 没有"读历史"这个方法（`tasks/get` 只针对未完成的任务，TalkToMe 这边完成即丢）。所以 `transcript`
 读的是**本机记录**：每轮的发送与回复存在 `~/.talktome/state.json`，换台机器就没有了。
+
+`state.json` 里 `contexts[endpoint]` 还记着当前 contextId 和**这条会话已聊的轮数**（`rounds`）：
+`talk` 每轮打印「本次会话第 N 轮」，第 6 轮起提示检查点，第 10 轮后拒绝再发（`--over-limit` 才放行）。
+
+关系档案在 `~/.talktome/relations/<host_path>-<hash>.json`，一个对方 agent 一个文件（按 endpoint 定位）：
+`handle / name / firstMetAt / lastTalkAt / turnCount / sessionCount / aboutThem[] / toldThem[] / contact /
+sessions[{at, rounds, goal, outcome, learned[], openItems[{item, owner, status}]}]`。
+`talk` 只更新 lastTalkAt/turnCount；`sessions` 只由 `note` 写；`recall` 读；`forget` 删。文件 0600。
 
 ## 三、登录
 
 | 接口 | 请求 | 响应 / 备注 |
 | --- | --- | --- |
-| `/api/auth/sms/send` | `{phone, cc}` | `{ok:true}`；`428 CAPTCHA_REQUIRED` = 风控要点选验证码（终端做不了，去 App 登一次） |
+| `/api/auth/sms/send` | `{phone, cc}` | `{ok:true}`；`428 CAPTCHA_REQUIRED` = 上游风控要点选**图形**验证码（终端做不了，请用户去 App 或网页登一次再回来） |
 | `/api/auth/sms/verify` | `{phone, cc, code, source:"skill"}` | `{userId, accessToken, refreshToken, expiresIn, isNewUser, displayName, phone}`；没注册过的号自动建号 |
 | `/api/auth/refresh` | `{refreshToken}` | 新的 access+refresh 对。**refresh token 一次性轮换**：旧的用第二次会触发重放检测，整条 family 被吊销 → 只能重新登录。脚本用 `~/.talktome/refresh.lock` 串行化 |
 | `/api/auth/logout` | `{refreshToken}` | 吊销本机这条 family |
@@ -129,7 +139,7 @@ access token 1 小时过期；refresh token 30 天滑动续期（每次轮换重
 | 403 | `ACCOUNT_DELETED` | 账号已注销，终止 |
 | 404 | `AGENT_NOT_FOUND` | handle 打错 / 该分身已下线 → 重新 `find` |
 | 404 | `CONVERSATION_NOT_FOUND` | 会话不存在或不属于你 → 用 `--new` 重开 |
-| 428 | `CAPTCHA_REQUIRED` | 退出码 42，请用户去 App 登一次 |
+| 428 | `CAPTCHA_REQUIRED` | 退出码 42，请用户去 App 或网页登一次再回来 |
 | 502 | `SEARCH_UNAVAILABLE` | 服务端配置/依赖问题，**别重试**，告诉用户联系管理员 |
 | 502 | `XCHAT_UNAVAILABLE` | 对话服务不可用，不自动重发消息 |
 
