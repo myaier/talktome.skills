@@ -2,18 +2,21 @@
 
 **简体中文** · [English](README.en.md)
 
-TalkToMe 的 AI Agent 技能集合。仓库里有两个技能，每个子目录就是一个技能（`SKILL.md` + `scripts/`），都是零依赖 Python 脚本 + 一份给 agent 看的操作说明。
+TalkToMe 的 AI Agent 技能集合。仓库里有三个技能，每个子目录就是一个技能（`SKILL.md` + `scripts/`），都是零依赖 Python 脚本 + 一份给 agent 看的操作说明。
 
-本文件是**给 agent 看的安装说明**：照着做完，Claude Code / Codex / Kimi CLI 等宿主就能用上这两个技能。
+本文件是**给 agent 看的安装说明**：照着做完，Claude Code / Codex / Kimi CLI 等宿主就能用上这些技能。
 
 ---
 
-## 一、这两个技能分别干什么
+## 一、这些技能分别干什么
 
 | 技能 | 方向 | 一句话作用 | 用户通常会这么说 |
 |---|---|---|---|
 | [deploy-talktome](deploy-talktome/) | 对外**造** | 把用户的资料/笔记/一段讨论，整理成人设（soul）+ 开场白 + 知识库，登录后创建分身、上传、设主页名、经用户确认发布到 `talkto.bio/{handle}` | “帮我把 ./docs 里的内容做成一个 talktome 分身”“把刚才关于定价的讨论做成分身”“上线我的分身”“改一下我分身的人设” |
 | [talktome-chat](talktome-chat/) | 对外**问** | 用户有个“得问个懂行的人”的需求时，去平台上语义检索对口的分身（真人的对外代理），用户确认后替他聊到目的达成（10 轮硬上限），把结论带回来并留档、下次能接着聊 | “想找人聊聊融资”“帮我问问这家公司的面试流程”“找个做供应链的人请教一下”“上次跟那个分身聊了什么” |
+| [event-registration](event-registration/) | 活动报名 | 只凭活动编号取最新表单，准备答案并保存本人草稿；回到小程序或 Native 核对提交 | “帮我填写这个活动的报名表” |
+
+`event-registration` 独立处理活动报名草稿。安装其同名目录后运行 `python scripts/register.py form 活动编号`；登录、附件与保存命令见该目录的 `SKILL.md`。用户只提供活动编号，正式报名和活动分身发布由客户端核对确认。
 
 一句话区分：**deploy-talktome 是把用户变成一个能被别人问的分身；talktome-chat 是替用户去问别人的分身。** 两个互不依赖，可以只装其中一个。
 
@@ -155,7 +158,7 @@ python ~/.claude/skills/talktome-chat/scripts/talktome.py whoami   # 退出码 4
 
 ## 七、需要用户确认的动作（两个技能都遵守）
 
-这两个技能会产生**对外可见的真实后果**，以下动作必须先拿到用户明确同意，agent 不得自行决定：
+这些技能会产生**对外可见的真实后果**，以下动作必须先拿到用户明确同意，agent 不得自行决定：
 
 - 设置主页名 handle（`talkto.bio/{handle}`，同时锁定分身邮箱 `{handle}@talkto.bio`）——**设置后不可更改**
 - 发布分身（发布后任何人都能访问）
